@@ -1,7 +1,7 @@
 # DiskANN Implementation in Rust 🦀
 
 [![Latest Version](https://img.shields.io/crates/v/rust_diskann?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/rust_diskann)
-[![docs.rs](https://img.shields.io/docsrs/rust_diskann?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/rust_diskann/latest/rust_diskann/)
+[![docs.rs](https://img.shields.io/docsrs/rust-diskann?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/rust_diskann/latest/rust_diskann/)
 
 
 A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html) (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. This project provides an efficient and scalable solution for large-scale vector similarity search with minimal memory footprint, as an alternative to the widely used in-memory [HNSW](https://ieeexplore.ieee.org/abstract/document/8594636) algorithm. 
