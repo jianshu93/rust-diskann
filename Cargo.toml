@@ -6,8 +6,7 @@ repository = "https://github.com/jianshu93/rust-diskann"
 description = "A native Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search)"
 license = "MIT" 
 keywords = [
-    "DiskANN",
-    "Graph-algorithms",
+    "graph-based-nearest-neighbors",
     "Vector-Search",
     "On-disk",
     "Nearest-Neighbours",
