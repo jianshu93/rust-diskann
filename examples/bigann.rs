@@ -1,6 +1,6 @@
 //! examples/bigann.rs
 //!
-//! BigANN for diskann-rs.
+//! BigANN for rust-diskann.
 //! - expects these files in the repository root:
 //!     bigann_base.bvecs, bigann_query.bvecs, dis_100M.fvecs, idx_100M.ivecs
 //! - builds (or reuses) a DiskANN index at "big_diskann_index.db"
