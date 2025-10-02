@@ -31,6 +31,7 @@ This implementation follows the DiskANN paper's approach:
 - **Medoid-based entry points**: Smart starting points for search
 - **Parallel query processing**: Using rayon for concurrent searches. Note: this may increase the loaded pages during memory map
 - **Minimal memory footprint**: ~330MB RAM for 2GB index (16% of file size)
+- **Extensitve benchmarks**: Speed, accuracy and memory consumption benchmark with HNSW (both in-memory and on-disk)
 
 ## Usage in Rust 🦀
 
@@ -211,4 +212,4 @@ Jayaram Subramanya, S., Devvrit, F., Simhadri, H.V., Krishnawamy, R. and Kadekod
 
 ## Acknowledgments
 
-This implementation is based on the DiskANN paper and the official Microsoft implementation. It was also largely inspired by the implementation [here](https://github.com/lukaesch/diskann-rs).
+This implementation is based on the DiskANN paper and the official Microsoft implementation. It was also largely inspired by the implementation [here](https://github.com/lukaesch/diskann-rs). 
