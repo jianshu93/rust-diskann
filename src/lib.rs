@@ -479,7 +479,7 @@ where
         self.dist.eval(query, vector)
     }
 
-    /// Gets a vector from the index (useful for tests)
+    /// Gets a vector from the index
     pub fn get_vector(&self, idx: usize) -> Vec<f32> {
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
         let start = offset as usize;
@@ -622,7 +622,7 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
         // Build incoming as CSR
         let (incoming_flat, incoming_off) = build_incoming_csr(&order, &new_graph, n);
 
-        // Union + prune in parallel
+        // Union and prune in parallel
         graph = (0..n)
             .into_par_iter()
             .map(|u| {
@@ -721,7 +721,7 @@ fn greedy_search<D: Distance<f32> + Copy>(
     v.into_iter().map(|c| (c.id, c.dist)).collect()
 }
 
-/// α-pruning from DiskANN/Vamana
+/// α-pruning
 fn prune_neighbors<D: Distance<f32> + Copy>(
     node_id: usize,
     candidates: &[(u32, f32)],
