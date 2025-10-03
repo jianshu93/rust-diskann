@@ -15,6 +15,11 @@ keywords = [
 categories = ["algorithms", "database", "data-structures", "science"]
 
 
+[lib]
+name = "rust_diskann"
+crate-type = ["cdylib", "rlib"]
+
+
 [dependencies]
 rand = "0.8"
 memmap2 = "0.5"
