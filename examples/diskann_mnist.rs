@@ -71,7 +71,7 @@ fn main() -> Result<(), DiskAnnError> {
         let start_cpu = ProcessTime::now();
         let start_wall = SystemTime::now();
 
-        let idx = DiskANN::<DistL2>::build_index_with_params(
+        let idx = DiskANN::<f32, DistL2>::build_index_with_params(
             &train_vectors,
             DistL2 {},
             index_path,
@@ -89,7 +89,7 @@ fn main() -> Result<(), DiskAnnError> {
     } else {
         println!("\nIndex file {} exists, opening…", index_path);
         let start_wall = SystemTime::now();
-        let idx = DiskANN::<DistL2>::open_index_with(index_path, DistL2 {})?;
+        let idx = DiskANN::<f32, DistL2>::open_index_with(index_path, DistL2)?;
         let wall_time = start_wall.elapsed().unwrap();
         println!(
             "Opened index: {} vectors, dim={}, metric={} in {:?}",

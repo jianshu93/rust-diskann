@@ -27,6 +27,7 @@ This implementation follows the DiskANN paper's approach:
 
 - **Vamana graph construction**: Efficient graph building with α-pruning, with rayon for concurrent and parallel construction
 - **Memory-efficient search**: Uses beam search that visits < 1% of vectors
+- **Generic over any vector<T>**: suport various types of vector input.
 - **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distance metrics
 - **Medoid-based entry points**: Smart starting points for search
 - **Parallel query processing**: Using rayon for concurrent searches. Note: this may increase the loaded pages during memory map
@@ -48,7 +49,7 @@ let vectors: Vec<Vec<f32>> = vec![
 ];
 
 // Easiest: build with defaults (M=64, L_build=128, alpha=1.2)
-let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, "index.db")?;
+let index = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, "index.db")?;
 
 // Or: custom construction parameters
 let params = DiskAnnParams {
@@ -56,7 +57,7 @@ let params = DiskAnnParams {
     build_beam_width: 128, // construction beam width
     alpha: 1.2,            // α for pruning
 };
-let index2 = DiskANN::<DistCosine>::build_index_with_params(
+let index2 = DiskANN::<f32, DistCosine>::build_index_with_params(
     &vectors,
     DistCosine {},
     "index_cos.db",
@@ -71,10 +72,10 @@ use anndists::dist::DistL2;
 use diskann_rs::DiskANN;
 
 // If you built with DistL2 and defaults:
-let index = DiskANN::<DistL2>::open_index_default_metric("index.db")?;
+let index = DiskANN::<f32, DistL2>::open_index_default_metric("index.db")?;
 
 // Or, explicitly provide the distance you built with:
-let index2 = DiskANN::<DistL2>::open_index_with("index.db", DistL2 {})?;
+let index2 = DiskANN::<f32, DistL2>::open_index_with("index.db", DistL2)?;
 ```
 
 ### Searching the Index
@@ -83,7 +84,7 @@ let index2 = DiskANN::<DistL2>::open_index_with("index.db", DistL2 {})?;
 use anndists::dist::DistL2;
 use diskann_rs::DiskANN;
 
-let index = DiskANN::<DistL2>::open_index_default_metric("index.db")?;
+let index = DiskANN::<f32, DistL2>::open_index_default_metric("index.db")?;
 let query: Vec<f32> = vec![0.1, 0.2, 0.4]; // length must match the indexed dim
 let k = 10;
 let beam = 256; // search beam width
@@ -102,7 +103,7 @@ use anndists::dist::DistL2;
 use diskann_rs::DiskANN;
 use rayon::prelude::*;
 
-let index = DiskANN::<DistL2>::open_index_default_metric("index.db")?;
+let index = DiskANN::<f32, DistL2>::open_index_default_metric("index.db")?;
 
 // Suppose you have a batch of queries
 let query_batch: Vec<Vec<f32>> = /* ... */;

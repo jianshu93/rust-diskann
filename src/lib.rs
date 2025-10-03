@@ -1,52 +1,50 @@
-//! # DiskAnn (generic over `anndists::Distance<f32>`)
+//! # DiskAnn (generic over `anndists::Distance<T>`)
 //!
 //! A minimal, on-disk, DiskANN-like library that:
 //! - Builds a Vamana-style graph (greedy + α-pruning) in memory
 //! - Writes vectors + fixed-degree adjacency to a single file
 //! - Memory-maps the file for low-overhead reads
-//! - Is **generic over any Distance<f32>** from `anndists` (L2, Cosine, Hamming, Dot, …)
+//! - Is **generic over any Distance<T>** from `anndists` (e.g. L2 on `f32`, Cosine on `f32`,
+//!   Hamming on `u8`, `u64`, …)
 //!
-//! ## Example
+//! ## Example (f32 / L2)
 //! ```no_run
-//! use anndists::dist::{DistL2, DistCosine};
+//! use anndists::dist::DistL2;
 //! use diskann_rs::{DiskANN, DiskAnnParams};
 //!
-//! // Build a new index from vectors, using L2 and default params
-//! let vectors = vec![vec![0.0; 128]; 1000];
-//! let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2{}, "index.db").unwrap();
+//! let vectors: Vec<Vec<f32>> = vec![vec![0.0; 128]; 1000];
+//! let index = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, "index.db").unwrap();
 //!
-//! // Or with custom params
-//! let index2 = DiskANN::<DistCosine>::build_index_with_params(
-//!     &vectors,
-//!     DistCosine{},
-//!     "index_cos.db",
-//!     DiskAnnParams { max_degree: 48, ..Default::default() },
-//! ).unwrap();
+//! let q = vec![0.0; 128];
+//! let nns = index.search(&q, 10, 64);
+//! ```
 //!
-//! // Search the index
-//! let query = vec![0.0; 128];
-//! let neighbors = index.search(&query, 10, 64);
-//!
-//! // Open later (provide the same distance type)
-//! let _reopened = DiskANN::<DistL2>::open_index_default_metric("index.db").unwrap();
+//! ## Example (u64 + Hamming)
+//! ```no_run
+//! use anndists::dist::DistHamming;
+//! use diskann_rs::{DiskANN, DiskAnnParams};
+//! let index: Vec<Vec<u64>> = vec![vec![0u64; 128]; 1000];
+//! let idx = DiskANN::<u64, DistHamming>::build_index_default(&index, DistHamming, "mh.db").unwrap();
+//! let q = vec![0u64; 128];
+//! let _ = idx.search(&q, 10, 64);
 //! ```
 //!
 //! ## File Layout
 //! [ metadata_len:u64 ][ metadata (bincode) ][ padding up to vectors_offset ]
-//! [ vectors (num * dim * f32) ][ adjacency (num * max_degree * u32) ]
+//! [ vectors (num * dim * T) ][ adjacency (num * max_degree * u32) ]
 //!
 //! `vectors_offset` is a fixed 1 MiB gap by default.
 
 use anndists::prelude::Distance;
-use bytemuck;
 use memmap2::Mmap;
-use rand::prelude::*;
+use rand::{prelude::*, thread_rng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use thiserror::Error;
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
@@ -74,7 +72,7 @@ impl Default for DiskAnnParams {
     }
 }
 
-/// Custom error type for DiskAnnRS operations
+/// Custom error type for DiskAnn operations
 #[derive(Debug, Error)]
 pub enum DiskAnnError {
     /// Represents I/O errors during file operations
@@ -99,6 +97,7 @@ struct Metadata {
     medoid_id: u32,
     vectors_offset: u64,
     adjacency_offset: u64,
+    elem_size: u8,
     distance_name: String,
 }
 
@@ -116,7 +115,6 @@ impl PartialEq for Candidate {
 impl Eq for Candidate {}
 impl PartialOrd for Candidate {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Natural order by distance: smaller is "less".
         self.dist.partial_cmp(&other.dist)
     }
 }
@@ -126,10 +124,11 @@ impl Ord for Candidate {
     }
 }
 
-/// Main struct representing a DiskANN index (generic over distance)
-pub struct DiskANN<D>
+/// Main struct representing a DiskANN index (generic over vector element `T` and distance `D`)
+pub struct DiskANN<T, D>
 where
-    D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
     /// Dimensionality of vectors in the index
     pub dim: usize,
@@ -151,17 +150,21 @@ where
 
     /// The distance strategy
     dist: D,
+
+    /// keep `T` in the type so the compiler knows about it
+    _phantom: PhantomData<T>,
 }
 
 // constructors
 
-impl<D> DiskANN<D>
+impl<T, D> DiskANN<T, D>
 where
-    D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
-    /// Build with default parameters: (M=32, L=256, alpha=1.2).
+    /// Build with default parameters: (M=64, L=128, alpha=1.2).
     pub fn build_index_default(
-        vectors: &[Vec<f32>],
+        vectors: &[Vec<T>],
         dist: D,
         file_path: &str,
     ) -> Result<Self, DiskAnnError> {
@@ -177,7 +180,7 @@ where
 
     /// Build with a `DiskAnnParams` bundle.
     pub fn build_index_with_params(
-        vectors: &[Vec<f32>],
+        vectors: &[Vec<T>],
         dist: D,
         file_path: &str,
         p: DiskAnnParams,
@@ -191,16 +194,66 @@ where
             file_path,
         )
     }
+
+    /// Opens an existing index file, supplying the distance strategy explicitly.
+    pub fn open_index_with(path: &str, dist: D) -> Result<Self, DiskAnnError> {
+        let mut file = OpenOptions::new().read(true).write(false).open(path)?;
+
+        // Read metadata length
+        let mut buf8 = [0u8; 8];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut buf8)?;
+        let md_len = u64::from_le_bytes(buf8);
+
+        // Read metadata
+        let mut md_bytes = vec![0u8; md_len as usize];
+        file.read_exact(&mut md_bytes)?;
+        let metadata: Metadata = bincode::deserialize(&md_bytes)?;
+
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+        // Validate element size vs T
+        let want = std::mem::size_of::<T>() as u8;
+        if metadata.elem_size != want {
+            return Err(DiskAnnError::IndexError(format!(
+                "element size mismatch: file has {}B, T is {}B",
+                metadata.elem_size, want
+            )));
+        }
+
+        // Optional sanity/logging: warn if type differs from recorded name
+        let expected = std::any::type_name::<D>();
+        if metadata.distance_name != expected {
+            eprintln!(
+                "Warning: index recorded distance `{}` but you opened with `{}`",
+                metadata.distance_name, expected
+            );
+        }
+
+        Ok(Self {
+            dim: metadata.dim,
+            num_vectors: metadata.num_vectors,
+            max_degree: metadata.max_degree,
+            distance_name: metadata.distance_name,
+            medoid_id: metadata.medoid_id,
+            vectors_offset: metadata.vectors_offset,
+            adjacency_offset: metadata.adjacency_offset,
+            mmap,
+            dist,
+            _phantom: PhantomData,
+        })
+    }
 }
 
-/// Extra sugar when your distance type implements `Default` (most unit-struct metrics do).
-impl<D> DiskANN<D>
+/// Extra sugar when your distance type implements `Default`.
+impl<T, D> DiskANN<T, D>
 where
-    D: Distance<f32> + Default + Send + Sync + Copy + Clone + 'static,
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Default + Send + Sync + Copy + Clone + 'static,
 {
     /// Build with default params **and** `D::default()` metric.
     pub fn build_index_default_metric(
-        vectors: &[Vec<f32>],
+        vectors: &[Vec<T>],
         file_path: &str,
     ) -> Result<Self, DiskAnnError> {
         Self::build_index_default(vectors, D::default(), file_path)
@@ -212,21 +265,22 @@ where
     }
 }
 
-impl<D> DiskANN<D>
+impl<T, D> DiskANN<T, D>
 where
-    D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
     /// Builds a new index from provided vectors
     ///
     /// # Arguments
-    /// * `vectors` - The vectors to index (slice of Vec<f32>)
-    /// * `max_degree` - Maximum edges per node (M ~ 24-64)
+    /// * `vectors` - The vectors to index (slice of Vec<T>)
+    /// * `max_degree` - Maximum edges per node (M ~ 24-64+)
     /// * `build_beam_width` - Construction L (e.g., 128-400)
     /// * `alpha` - Pruning parameter (1.2–2.0)
-    /// * `dist` - Any `anndists::Distance<f32>` (e.g., `DistL2`)
+    /// * `dist` - Any `anndists::Distance<T>`
     /// * `file_path` - Path of index file
     pub fn build_index(
-        vectors: &[Vec<f32>],
+        vectors: &[Vec<T>],
         max_degree: usize,
         build_beam_width: usize,
         alpha: f32,
@@ -259,12 +313,20 @@ where
 
         // Reserve space for metadata (we'll write it after data)
         let vectors_offset = 1024 * 1024;
-        let total_vector_bytes = (num_vectors as u64) * (dim as u64) * 4;
+        // Ensure alignment (1 MiB is aligned for any T, but assert anyway)
+        assert_eq!(
+            (vectors_offset as usize) % std::mem::align_of::<T>(),
+            0,
+            "vectors_offset must be aligned for T"
+        );
+
+        let elem_sz = std::mem::size_of::<T>() as u64;
+        let total_vector_bytes = (num_vectors as u64) * (dim as u64) * elem_sz;
 
         // Write vectors contiguous (sequential I/O is fastest)
-        file.seek(SeekFrom::Start(vectors_offset))?;
+        file.seek(SeekFrom::Start(vectors_offset as u64))?;
         for vector in vectors {
-            let bytes = bytemuck::cast_slice(vector);
+            let bytes = bytemuck::cast_slice::<T, u8>(vector);
             file.write_all(bytes)?;
         }
 
@@ -287,7 +349,7 @@ where
         for neighbors in &graph {
             let mut padded = neighbors.clone();
             padded.resize(max_degree, PAD_U32);
-            let bytes = bytemuck::cast_slice(&padded);
+            let bytes = bytemuck::cast_slice::<u32, u8>(&padded);
             file.write_all(bytes)?;
         }
 
@@ -299,6 +361,7 @@ where
             medoid_id: medoid_id as u32,
             vectors_offset: vectors_offset as u64,
             adjacency_offset,
+            elem_size: std::mem::size_of::<T>() as u8,
             distance_name: std::any::type_name::<D>().to_string(),
         };
 
@@ -322,53 +385,14 @@ where
             adjacency_offset: metadata.adjacency_offset,
             mmap,
             dist,
-        })
-    }
-
-    /// Opens an existing index file, supplying the distance strategy explicitly.
-    pub fn open_index_with(path: &str, dist: D) -> Result<Self, DiskAnnError> {
-        let mut file = OpenOptions::new().read(true).write(false).open(path)?;
-
-        // Read metadata length
-        let mut buf8 = [0u8; 8];
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut buf8)?;
-        let md_len = u64::from_le_bytes(buf8);
-
-        // Read metadata
-        let mut md_bytes = vec![0u8; md_len as usize];
-        file.read_exact(&mut md_bytes)?;
-        let metadata: Metadata = bincode::deserialize(&md_bytes)?;
-
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-        // Optional sanity/logging: warn if type differs from recorded name
-        let expected = std::any::type_name::<D>();
-        if metadata.distance_name != expected {
-            eprintln!(
-                "Warning: index recorded distance `{}` but you opened with `{}`",
-                metadata.distance_name, expected
-            );
-        }
-
-        Ok(Self {
-            dim: metadata.dim,
-            num_vectors: metadata.num_vectors,
-            max_degree: metadata.max_degree,
-            distance_name: metadata.distance_name,
-            medoid_id: metadata.medoid_id,
-            vectors_offset: metadata.vectors_offset,
-            adjacency_offset: metadata.adjacency_offset,
-            mmap,
-            dist,
+            _phantom: PhantomData,
         })
     }
 
     /// Searches the index for nearest neighbors using a best-first beam search.
     /// Termination rule: continue while the best frontier can still improve the worst in working set.
     /// Like `search` but also returns the distance for each neighbor.
-    /// Distances are exactly the ones computed during the beam search.
-    pub fn search_with_dists(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
+    pub fn search_with_dists(&self, query: &[T], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
         assert_eq!(
             query.len(),
             self.dim,
@@ -376,28 +400,6 @@ where
             query.len(),
             self.dim
         );
-
-        #[derive(Clone, Copy)]
-        struct Candidate {
-            dist: f32,
-            id: u32,
-        }
-        impl PartialEq for Candidate {
-            fn eq(&self, o: &Self) -> bool {
-                self.dist == o.dist && self.id == o.id
-            }
-        }
-        impl Eq for Candidate {}
-        impl PartialOrd for Candidate {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                self.dist.partial_cmp(&o.dist)
-            }
-        }
-        impl Ord for Candidate {
-            fn cmp(&self, o: &Self) -> Ordering {
-                self.partial_cmp(o).unwrap_or(Ordering::Equal)
-            }
-        }
 
         let mut visited = HashSet::new();
         let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // best-first by dist
@@ -452,8 +454,9 @@ where
         results.truncate(k);
         results.into_iter().map(|c| (c.id, c.dist)).collect()
     }
+
     /// search but only return neighbor ids
-    pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
+    pub fn search(&self, query: &[T], k: usize, beam_width: usize) -> Vec<u32> {
         self.search_with_dists(query, k, beam_width)
             .into_iter()
             .map(|(id, _dist)| id)
@@ -470,45 +473,49 @@ where
     }
 
     /// Computes distance between `query` and vector `idx`
-    fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
-        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+    fn distance_to(&self, query: &[T], idx: usize) -> f32 {
+        let elem_sz = std::mem::size_of::<T>();
+        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * elem_sz as u64);
         let start = offset as usize;
-        let end = start + (self.dim * 4);
+        let end = start + (self.dim * elem_sz);
         let bytes = &self.mmap[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
+        let vector: &[T] = bytemuck::cast_slice(bytes);
         self.dist.eval(query, vector)
     }
 
     /// Gets a vector from the index
-    pub fn get_vector(&self, idx: usize) -> Vec<f32> {
-        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+    pub fn get_vector(&self, idx: usize) -> Vec<T> {
+        let elem_sz = std::mem::size_of::<T>();
+        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * elem_sz as u64);
         let start = offset as usize;
-        let end = start + (self.dim * 4);
+        let end = start + (self.dim * elem_sz);
         let bytes = &self.mmap[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
+        let vector: &[T] = bytemuck::cast_slice(bytes);
         vector.to_vec()
     }
 }
 
-/// Calculates the medoid (vector closest to the centroid) using distance `D`
+/// Calculates the medoid (vector closest to a small pivot set) using distance `D`
 /// Parallelizes the per-vector distance evaluations.
-fn calculate_medoid<D: Distance<f32> + Copy + Sync>(vectors: &[Vec<f32>], dist: D) -> usize {
-    let dim = vectors[0].len();
-    let mut centroid = vec![0.0f32; dim];
+fn calculate_medoid<T, D>(vectors: &[Vec<T>], dist: D) -> usize
+where
+    T: bytemuck::Pod + Copy + Send + Sync,
+    D: Distance<T> + Copy + Sync,
+{
+    let n = vectors.len();
+    let k = 8.min(n); // lightweight approximation
+    let mut rng = thread_rng();
+    let pivots: Vec<usize> = (0..k).map(|_| rng.gen_range(0..n)).collect();
 
-    for v in vectors {
-        for (i, &val) in v.iter().enumerate() {
-            centroid[i] += val;
-        }
-    }
-    for val in &mut centroid {
-        *val /= vectors.len() as f32;
-    }
-
-    let (best_idx, _best_dist) = vectors
-        .par_iter()
-        .enumerate()
-        .map(|(idx, v)| (idx, dist.eval(&centroid, v)))
+    let (best_idx, _best_score) = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let score: f32 = pivots
+                .iter()
+                .map(|&p| dist.eval(&vectors[i], &vectors[p]))
+                .sum();
+            (i, score)
+        })
         .reduce(|| (0usize, f32::MAX), |a, b| if a.1 <= b.1 { a } else { b });
 
     best_idx
@@ -518,14 +525,18 @@ fn calculate_medoid<D: Distance<f32> + Copy + Sync>(vectors: &[Vec<f32>], dist: 
 /// - Multi-seed candidate gathering (medoid + random seeds)
 /// - Union with current adjacency before α-prune
 /// - 2 refinement passes with symmetrization after each pass
-fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
-    vectors: &[Vec<f32>],
+fn build_vamana_graph<T, D>(
+    vectors: &[Vec<T>],
     max_degree: usize,
     build_beam_width: usize,
     alpha: f32,
     dist: D,
     medoid_id: u32,
-) -> Vec<Vec<u32>> {
+) -> Vec<Vec<u32>>
+where
+    T: bytemuck::Pod + Copy + Send + Sync,
+    D: Distance<T> + Copy + Sync,
+{
     let n = vectors.len();
     let mut graph = vec![Vec::<u32>::new(); n];
 
@@ -550,7 +561,6 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
     const EXTRA_SEEDS: usize = 2;
 
     let mut rng = thread_rng();
-    // The number of passes is key to the quality of the final graph, more passes can lead to better refinement but also increase computation time.
     for _pass in 0..PASSES {
         // Shuffle visit order each pass
         let mut order: Vec<usize> = (0..n).collect();
@@ -563,7 +573,6 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
         let new_graph: Vec<Vec<u32>> = order
             .par_iter()
             .map(|&u| {
-                // the EXTRA_SEEDS random seeds help explore the graph better during construction, but at a cost of more computation.
                 let mut candidates: Vec<(u32, f32)> =
                     Vec::with_capacity(build_beam_width * (2 + EXTRA_SEEDS));
 
@@ -583,14 +592,8 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
 
                 // Gather candidates from greedy searches
                 for start in seeds {
-                    let mut part = greedy_search(
-                        &vectors[u],
-                        vectors,
-                        snapshot,
-                        start,
-                        build_beam_width,
-                        dist,
-                    );
+                    let mut part =
+                        greedy_search(&vectors[u], vectors, snapshot, start, build_beam_width, dist);
                     candidates.append(&mut part);
                 }
 
@@ -613,7 +616,6 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
             .collect();
 
         // Symmetrize: union incoming + outgoing, then α-prune again (parallel)
-        // Build inverse map: node-id -> position in `order`
         let mut pos_of = vec![0usize; n];
         for (pos, &u) in order.iter().enumerate() {
             pos_of[u] = pos;
@@ -667,14 +669,18 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
 
 /// Greedy search used during construction (read-only on `graph`)
 /// Same termination rule as query-time search.
-fn greedy_search<D: Distance<f32> + Copy>(
-    query: &[f32],
-    vectors: &[Vec<f32>],
+fn greedy_search<T, D>(
+    query: &[T],
+    vectors: &[Vec<T>],
     graph: &[Vec<u32>],
     start_id: usize,
     beam_width: usize,
     dist: D,
-) -> Vec<(u32, f32)> {
+) -> Vec<(u32, f32)>
+where
+    T: bytemuck::Pod + Copy + Send + Sync,
+    D: Distance<T> + Copy,
+{
     let mut visited = HashSet::new();
     let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // min-heap by dist
     let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // max-heap by dist
@@ -722,14 +728,18 @@ fn greedy_search<D: Distance<f32> + Copy>(
 }
 
 /// α-pruning
-fn prune_neighbors<D: Distance<f32> + Copy>(
+fn prune_neighbors<T, D>(
     node_id: usize,
     candidates: &[(u32, f32)],
-    vectors: &[Vec<f32>],
+    vectors: &[Vec<T>],
     max_degree: usize,
     alpha: f32,
     dist: D,
-) -> Vec<u32> {
+) -> Vec<u32>
+where
+    T: bytemuck::Pod + Copy + Send + Sync,
+    D: Distance<T> + Copy,
+{
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -829,7 +839,7 @@ mod tests {
             vec![0.5, 0.5],
         ];
 
-        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+        let index = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
 
         let q = vec![0.1, 0.1];
         let nns = index.search(&q, 3, 8);
@@ -856,7 +866,7 @@ mod tests {
         ];
 
         let index =
-            DiskANN::<DistCosine>::build_index_default(&vectors, DistCosine {}, path).unwrap();
+            DiskANN::<f32, DistCosine>::build_index_default(&vectors, DistCosine, path).unwrap();
 
         let q = vec![2.0, 0.0, 0.0]; // parallel to [1,0,0]
         let nns = index.search(&q, 2, 8);
@@ -886,16 +896,18 @@ mod tests {
         ];
 
         {
-            let _idx = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+            let _idx =
+                DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
         }
 
-        let idx2 = DiskANN::<DistL2>::open_index_default_metric(path).unwrap();
+        // Use the default-metric opener (D: Default), keeping the same T
+        let idx2 = DiskANN::<f32, DistL2>::open_index_default_metric(path).unwrap();
         assert_eq!(idx2.num_vectors, 4);
         assert_eq!(idx2.dim, 2);
 
         let q = vec![0.9, 0.9];
         let res = idx2.search(&q, 2, 8);
-        // [1,1] should be best
+        // [1,1] should be best (index 3)
         assert_eq!(res[0], 3);
 
         let _ = fs::remove_file(path);
@@ -914,9 +926,9 @@ mod tests {
             }
         }
 
-        let index = DiskANN::<DistL2>::build_index_with_params(
+        let index = DiskANN::<f32, DistL2>::build_index_with_params(
             &vectors,
-            DistL2 {},
+            DistL2,
             path,
             DiskAnnParams {
                 max_degree: 4,
@@ -954,9 +966,9 @@ mod tests {
             .map(|_| (0..d).map(|_| rng.r#gen::<f32>()).collect())
             .collect();
 
-        let index = DiskANN::<DistL2>::build_index_with_params(
+        let index = DiskANN::<f32, DistL2>::build_index_with_params(
             &vectors,
-            DistL2 {},
+            DistL2,
             path,
             DiskAnnParams {
                 max_degree: 32,

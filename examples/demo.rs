@@ -2,6 +2,7 @@
 use anndists::dist::DistCosine; // swap to DistL2, DistDot, etc. if desired
 use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use rand::prelude::*;
+use std::path::Path;
 use std::sync::Arc;
 
 fn main() -> Result<(), DiskAnnError> {
@@ -15,7 +16,7 @@ fn main() -> Result<(), DiskAnnError> {
     let alpha = 1.2f32;
 
     // Build if missing
-    if !std::path::Path::new(singlefile_path).exists() {
+    if !Path::new(singlefile_path).exists() {
         println!("Building DiskANN index at {singlefile_path}...");
 
         // Generate sample vectors (replace with your real dataset)
@@ -28,18 +29,16 @@ fn main() -> Result<(), DiskAnnError> {
             vectors.push(v);
         }
 
-        // Either: use the convenience default
-        // let _index = DiskANN::<DistCosine>::build_index_default(&vectors, DistCosine {}, singlefile_path)?;
-
         // Or: use explicit params (shown here)
         let params = DiskAnnParams {
             max_degree,
             build_beam_width,
             alpha,
         };
-        let index = DiskANN::<DistCosine>::build_index_with_params(
+        // NOTE: DiskANN<T, D> → T = f32, D = DistCosine
+        let index = DiskANN::<f32, DistCosine>::build_index_with_params(
             &vectors,
-            DistCosine {},
+            DistCosine,
             singlefile_path,
             params,
         )?;
@@ -53,9 +52,9 @@ fn main() -> Result<(), DiskAnnError> {
     }
 
     // Open the index (distance type must match what you used to build)
-    let index = Arc::new(DiskANN::<DistCosine>::open_index_with(
+    let index = Arc::new(DiskANN::<f32, DistCosine>::open_index_with(
         singlefile_path,
-        DistCosine {},
+        DistCosine,
     )?);
 
     println!(

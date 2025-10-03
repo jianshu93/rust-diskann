@@ -32,6 +32,7 @@ fn main() -> Result<(), DiskAnnError> {
             if i % 100_000 == 0 {
                 println!("  Generated {} vectors...", i);
             }
+            // use r#gen() because `gen` is a reserved keyword in newer Rust editions
             let v: Vec<f32> = (0..DIM).map(|_| rng.r#gen::<f32>()).collect();
             vectors.push(v);
         }
@@ -44,10 +45,10 @@ fn main() -> Result<(), DiskAnnError> {
             alpha: ALPHA,
         };
 
-        // Distance type must be the same for build and open
-        let _index = DiskANN::<DistCosine>::build_index_with_params(
+        // Distance type must match on open; include element type `f32`
+        let _index = DiskANN::<f32, DistCosine>::build_index_with_params(
             &vectors,
-            DistCosine {},
+            DistCosine,
             singlefile_path,
             params,
         )?;
@@ -60,11 +61,11 @@ fn main() -> Result<(), DiskAnnError> {
         );
     }
 
-    // Open index (must use the same distance type used at build time)
+    // Open index (same element + distance types as build)
     let open_start = Instant::now();
-    let index = Arc::new(DiskANN::<DistCosine>::open_index_with(
+    let index = Arc::new(DiskANN::<f32, DistCosine>::open_index_with(
         singlefile_path,
-        DistCosine {},
+        DistCosine,
     )?);
     let open_time = open_start.elapsed().as_secs_f32();
     println!(

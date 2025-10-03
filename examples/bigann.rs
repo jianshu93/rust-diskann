@@ -167,10 +167,10 @@ fn euclid(a: &[f32], b: &[f32]) -> f32 {
     s.sqrt()
 }
 
-fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> DiskANN<DistL2> {
+fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> DiskANN<f32, DistL2> {
     if Path::new(index_path).exists() {
         println!("Opening existing index at '{}'", index_path);
-        return DiskANN::<DistL2>::open_index_default_metric(index_path)
+        return DiskANN::<f32, DistL2>::open_index_default_metric(index_path)
             .expect("open_index_default_metric failed");
     }
 
@@ -197,8 +197,8 @@ fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> Di
 
     let t1 = Instant::now();
     let index =
-        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, index_path, DISKANN_PARAMS)
-            .expect("build_index_with_params failed");
+      DiskANN::<f32, DistL2>::build_index_with_params(&vectors, DistL2, index_path, DISKANN_PARAMS)
+          .expect("build_index_with_params failed");
 
     println!(
         "Build + write done in {:.1}s, {}",
@@ -210,7 +210,7 @@ fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> Di
 }
 
 fn eval_recall(
-    index: &DiskANN<DistL2>,
+    index: &DiskANN<f32, DistL2>,
     queries_f32: &[Vec<f32>],
     gt: &[Vec<(u32, f32)>], // (id, sqdist)
     k: usize,
@@ -254,7 +254,7 @@ fn eval_recall(
 
 // Single-threaded
 fn eval_recall_single(
-    index: &DiskANN<DistL2>,
+    index: &DiskANN<f32, DistL2>,
     queries_f32: &[Vec<f32>],
     gt: &[Vec<(u32, f32)>], // (id, sqdist)
     k: usize,

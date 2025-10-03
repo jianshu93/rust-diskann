@@ -1,6 +1,6 @@
 [package]
 name = "rust-diskann"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/jianshu93/rust-diskann"
 description = "A native Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search)"
