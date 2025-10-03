@@ -1,16 +1,16 @@
 //! # DiskAnn (generic over `anndists::Distance<T>`)
 //!
-//! A minimal, on-disk, DiskANN-like library that:
+//! An on-disk DiskANN library that:
 //! - Builds a Vamana-style graph (greedy + α-pruning) in memory
 //! - Writes vectors + fixed-degree adjacency to a single file
 //! - Memory-maps the file for low-overhead reads
 //! - Is **generic over any Distance<T>** from `anndists` (e.g. L2 on `f32`, Cosine on `f32`,
-//!   Hamming on `u8`, `u64`, …)
+//!   Hamming on `u64`, …)
 //!
-//! ## Example (f32 / L2)
+//! ## Example (f32 + L2)
 //! ```no_run
 //! use anndists::dist::DistL2;
-//! use diskann_rs::{DiskANN, DiskAnnParams};
+//! use rust_diskann::{DiskANN, DiskAnnParams};
 //!
 //! let vectors: Vec<Vec<f32>> = vec![vec![0.0; 128]; 1000];
 //! let index = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, "index.db").unwrap();
@@ -22,7 +22,7 @@
 //! ## Example (u64 + Hamming)
 //! ```no_run
 //! use anndists::dist::DistHamming;
-//! use diskann_rs::{DiskANN, DiskAnnParams};
+//! use rust_diskann::{DiskANN, DiskAnnParams};
 //! let index: Vec<Vec<u64>> = vec![vec![0u64; 128]; 1000];
 //! let idx = DiskANN::<u64, DistHamming>::build_index_default(&index, DistHamming, "mh.db").unwrap();
 //! let q = vec![0u64; 128];
