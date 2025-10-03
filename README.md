@@ -132,6 +132,10 @@ let results: Vec<Vec<u32>> = query_batch
 - `beam_width`: 128 or larger (trade-off between speed and recall)
 - Higher beam_width = better recall but slower search
 
+### Index memory-mapping
+
+When host RAM is not large enough for mapping the entire database file, it is possible to build the database in several smaller pieces (random split). Then users can search the query againt each piece and collect results from each piece before merging (rank by distance). This is equivalent to a single big database approach but requires a much smaller number of RAM for memory-mapping. 
+
 ## Building and Testing
 
 ```bash
