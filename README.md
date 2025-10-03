@@ -1,4 +1,4 @@
-# DiskANN: On-disk graph-based nearest neighbor search 🦀
+# DiskANN: On-disk graph-based approximate nearest neighbor search 🦀
 
 [![Latest Version](https://img.shields.io/crates/v/rust_diskann?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/rust_diskann)
 [![docs.rs](https://img.shields.io/docsrs/rust-diskann?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/rust_diskann/latest/rust_diskann/)
