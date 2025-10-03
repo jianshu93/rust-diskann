@@ -3,8 +3,8 @@
 
 use anndists::dist::DistL2;
 use cpu_time::ProcessTime;
-use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use rayon::prelude::*;
+use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 mod utils;

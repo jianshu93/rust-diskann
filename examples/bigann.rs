@@ -13,8 +13,8 @@
 
 use anndists::dist::DistL2;
 use byteorder::{LittleEndian, ReadBytesExt};
-use rust_diskann::{DiskANN, DiskAnnParams};
 use rayon::prelude::*;
+use rust_diskann::{DiskANN, DiskAnnParams};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
@@ -196,9 +196,13 @@ fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> Di
     );
 
     let t1 = Instant::now();
-    let index =
-      DiskANN::<f32, DistL2>::build_index_with_params(&vectors, DistL2, index_path, DISKANN_PARAMS)
-          .expect("build_index_with_params failed");
+    let index = DiskANN::<f32, DistL2>::build_index_with_params(
+        &vectors,
+        DistL2,
+        index_path,
+        DISKANN_PARAMS,
+    )
+    .expect("build_index_with_params failed");
 
     println!(
         "Build + write done in {:.1}s, {}",

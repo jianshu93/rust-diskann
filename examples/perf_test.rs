@@ -1,8 +1,8 @@
 // examples/perf_test.rs
 use anndists::dist::DistCosine; // swap to DistL2/DistDot/etc. if desired
-use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use rand::prelude::*;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use std::sync::Arc;
 use std::time::Instant;
 

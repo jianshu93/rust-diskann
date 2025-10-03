@@ -1,7 +1,7 @@
 // examples/demo.rs
 use anndists::dist::DistCosine; // swap to DistL2, DistDot, etc. if desired
-use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use rand::prelude::*;
+use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use std::path::Path;
 use std::sync::Arc;
 

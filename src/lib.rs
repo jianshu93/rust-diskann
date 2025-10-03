@@ -592,8 +592,14 @@ where
 
                 // Gather candidates from greedy searches
                 for start in seeds {
-                    let mut part =
-                        greedy_search(&vectors[u], vectors, snapshot, start, build_beam_width, dist);
+                    let mut part = greedy_search(
+                        &vectors[u],
+                        vectors,
+                        snapshot,
+                        start,
+                        build_beam_width,
+                        dist,
+                    );
                     candidates.append(&mut part);
                 }
 
@@ -896,8 +902,7 @@ mod tests {
         ];
 
         {
-            let _idx =
-                DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
+            let _idx = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
         }
 
         // Use the default-metric opener (D: Default), keeping the same T
