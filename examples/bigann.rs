@@ -34,8 +34,8 @@ const INDEX_PATH: &str = "big_diskann_index.db";
 
 // DiskANN build/search knobs (feel free to tweak).
 const DISKANN_PARAMS: DiskAnnParams = DiskAnnParams {
-    max_degree: 48,
-    build_beam_width: 200,
+    max_degree: 96,
+    build_beam_width: 192,
     alpha: 1.2,
 };
 const BEAM_SEARCH: usize = 512;
