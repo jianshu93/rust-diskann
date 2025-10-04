@@ -135,7 +135,7 @@ let results: Vec<Vec<u32>> = query_batch
 
 ### Index memory-mapping
 
-When host RAM is not large enough for mapping the entire database file, it is possible to build the database in several smaller pieces (random split). Then users can search the query againt each piece and collect results from each piece before merging (rank by distance). This is equivalent to a single big database approach but requires a much smaller number of RAM for memory-mapping. 
+When host RAM is not large enough for mapping the entire database file, it is possible to build the database in several smaller pieces (random split). Then users can search the query againt each piece and collect results from each piece before merging (rank by distance). This is equivalent to a single big database approach (as long as K'>=K) but requires a much smaller number of RAM for memory-mapping. In practice, the Microsoft Azure Cosmos DB found that this database shard idea can improve recall. Intutively, with smaller data points for each piece, we can use large M and build beam width to further improve accuracy. See their paper [here](https://www.vldb.org/pvldb/vol18/p5166-upreti.pdf)
 
 ## Building and Testing
 
