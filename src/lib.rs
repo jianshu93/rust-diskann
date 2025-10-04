@@ -522,7 +522,7 @@ where
 }
 
 /// Builds a strengthened Vamana-like graph using multi-pass refinement.
-/// - Multi-seed candidate gathering (medoid + random seeds)
+/// - Multi-seed candidate gathering (medoid and random seeds)
 /// - Union with current adjacency before α-prune
 /// - 2 refinement passes with symmetrization after each pass
 fn build_vamana_graph<T, D>(
@@ -851,7 +851,7 @@ mod tests {
         let nns = index.search(&q, 3, 8);
         assert_eq!(nns.len(), 3);
 
-        // Verify the first neighbor is quite close in L2
+        // Verify the first neighbor is quite close
         let v = index.get_vector(nns[0] as usize);
         assert!(euclid(&q, &v) < 1.0);
 
