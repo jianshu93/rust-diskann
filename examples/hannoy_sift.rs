@@ -6,16 +6,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-
 mod utils;
-use utils::*;
 use annhdf5::AnnBenchmarkData;
 use cpu_time::ProcessTime;
+use hannoy::{Database, Reader, Writer, distances::Euclidean};
 use heed::{Env, EnvOpenOptions, RwTxn};
-use hannoy::{distances::Euclidean, Database, Reader, Writer};
 use ndarray::s;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
+use utils::*;
 
 /// SIFT-1M (L2) dimensions
 const DIM: usize = 128;
@@ -133,7 +132,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     anndata.train_data.clear();
     anndata.train_data.shrink_to_fit();
 
-
     // Search; compute recall@k correctly
     //    - ID-overlap recall (robust)
     //    - distance recall using TRUE L2 (recomputed)
@@ -172,10 +170,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 l2s.push(euclid(q, &v));
             }
             // Keep result sorted by true L2 so it’s directly comparable to GT
-            let mut paired: Vec<(u32, f32)> = ids.iter().copied().zip(l2s.iter().copied()).collect();
+            let mut paired: Vec<(u32, f32)> =
+                ids.iter().copied().zip(l2s.iter().copied()).collect();
             paired.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            let (ids_sorted, dists_sorted): (Vec<u32>, Vec<f32>) =
-                paired.into_iter().unzip();
+            let (ids_sorted, dists_sorted): (Vec<u32>, Vec<f32>) = paired.into_iter().unzip();
 
             (ids_sorted, dists_sorted)
         })
@@ -218,7 +216,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         id_recalls.push(hits);
 
         // distance-based recall (using true L2, consistent with GT)
-        let dist_hits = dists.iter().take(true_k).filter(|&&d| d <= gt_kth_l2).count();
+        let dist_hits = dists
+            .iter()
+            .take(true_k)
+            .filter(|&&d| d <= gt_kth_l2)
+            .count();
         dist_recalls.push(dist_hits);
 
         // last distance ratio (ours / GT kth)
@@ -230,7 +232,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_distances_ratio.push(ratio);
     }
 
-    let mean_id_recall = (id_recalls.iter().sum::<usize>() as f32) / ((k * id_recalls.len()) as f32);
+    let mean_id_recall =
+        (id_recalls.iter().sum::<usize>() as f32) / ((k * id_recalls.len()) as f32);
     let mean_dist_recall =
         (dist_recalls.iter().sum::<usize>() as f32) / ((k * dist_recalls.len()) as f32);
     let mean_last_ratio =
@@ -241,7 +244,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     //println!("\n id-overlap recall@{}: {:.4}", k, mean_id_recall);
     println!(" distance recall@{}  : {:.4}", k, mean_dist_recall);
-    println!(" last distances ratio (ours true L2 / GT kth): {:.4}", mean_last_ratio);
+    println!(
+        " last distances ratio (ours true L2 / GT kth): {:.4}",
+        mean_last_ratio
+    );
     println!(
         " throughput: {:.0} q/s — cpu: {:?}  wall: {:?}",
         req_per_s, cpu_time, wall_time
@@ -270,7 +276,9 @@ fn build_hannoy(
 
     let mut rng = StdRng::seed_from_u64(42);
     let mut builder = writer.builder::<StdRng>(&mut rng);
-    builder.ef_construction(EF_CONSTRUCTION).build::<M, M0>(&mut wtxn)?;
+    builder
+        .ef_construction(EF_CONSTRUCTION)
+        .build::<M, M0>(&mut wtxn)?;
     wtxn.commit().unwrap();
 
     let cpu_time: Duration = start_cpu.elapsed();

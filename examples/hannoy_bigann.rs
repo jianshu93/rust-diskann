@@ -9,17 +9,15 @@
 // then evaluates recall@10 and recall@100 on NB_QUERY queries.
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use hannoy::{Database, Error as HannoyError, Reader, Writer, distances::Euclidean};
 use heed::{Env, EnvOpenOptions};
-use hannoy::{distances::Euclidean, Database, Error as HannoyError, Reader, Writer};
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-// ------------------------ Config ------------------------
 
 const DIM: usize = 128;
 
@@ -172,7 +170,9 @@ fn open_env(dir: &Path) -> heed::Result<Env> {
 }
 
 /// Try to open a Reader; if NeedBuild/MissingMetadata, return Ok(None).
-fn try_open_reader(env: &Env) -> Result<Option<(Reader<Euclidean>, Database<Euclidean>)>, Box<dyn Error>> {
+fn try_open_reader(
+    env: &Env,
+) -> Result<Option<(Reader<Euclidean>, Database<Euclidean>)>, Box<dyn Error>> {
     let mut wtxn = env.write_txn()?;
     let db: Database<Euclidean> = env.create_database(&mut wtxn, None)?;
     wtxn.commit()?;
@@ -207,7 +207,9 @@ fn build_and_open_reader(
 
     let mut rng = StdRng::seed_from_u64(42);
     let mut builder = writer.builder(&mut rng);
-    builder.ef_construction(EF_CONSTRUCTION).build::<M, M0>(&mut wtxn)?;
+    builder
+        .ef_construction(EF_CONSTRUCTION)
+        .build::<M, M0>(&mut wtxn)?;
     wtxn.commit()?;
 
     let rtxn = env.read_txn()?;
@@ -220,38 +222,45 @@ fn eval_distance_recall_parallel(
     env: &Env,
     reader: &Reader<Euclidean>,
     queries_f32: &[Vec<f32>],
-    gt_d2: &[Vec<f32>], // squared L2; we compare in squared space
+    gt_d2: &[Vec<f32>], // squared L2; kth is sqrt for reporting
     k: usize,
     ef_search: usize,
 ) {
-    let t0 = Instant::now();
+    let t0 = std::time::Instant::now();
 
     let (correct, last_ratio_sum, frac_returned_sum) = queries_f32
         .par_iter()
         .enumerate()
-        .map(|(qi, q)| {
-            // Open a read-txn per worker iteration (RoTxn is !Send/!Sync)
-            let rtxn = env.read_txn().expect("failed to open read txn");
-            let res = reader
-                .nns(k)
-                .ef_search(ef_search)
-                .by_vector(&rtxn, q)
-                .expect("hannoy search failed");
+        // one RoTxn per rayon worker thread:
+        .map_init(
+            || env.read_txn().expect("failed to open read txn"),
+            |rtxn, (qi, q)| {
+                // rtxn: &mut RoTxn — by_vector needs &RoTxn
+                let res = reader
+                    .nns(k)
+                    .ef_search(ef_search)
+                    .by_vector(&*rtxn, q)
+                    .expect("hannoy search failed");
 
-            let kth_sq = gt_d2[qi][k - 1];
-            let kth    = kth_sq.sqrt();              // for reporting
+                let kth_sq = gt_d2[qi][k - 1];
+                let kth = kth_sq.sqrt(); // for reporting
 
-            let returned = res.len();
-            // hannoy returns squared L2, compare directly to squared GT radius
-            let correct_here = res.iter().filter(|(_, d)| *d <= kth_sq).count();
+                let returned = res.len();
+                // hannoy returns squared L2, compare directly to squared GT radius
+                let correct_here = res.iter().filter(|(_, d)| *d <= kth_sq).count();
 
-            let last_ratio = if let Some((_, dlast)) = res.last() {
-                dlast.sqrt() / kth
-            } else {
-                0.0
-            };
-            (correct_here as usize, last_ratio, returned as f32 / k as f32)
-        })
+                let last_ratio = if let Some((_, dlast)) = res.last() {
+                    dlast.sqrt() / kth
+                } else {
+                    0.0
+                };
+                (
+                    correct_here as usize,
+                    last_ratio,
+                    returned as f32 / k as f32,
+                )
+            },
+        )
         .reduce(
             || (0usize, 0f32, 0f32),
             |(a1, a2, a3), (b1, b2, b3)| (a1 + b1, a2 + b2, a3 + b3),
@@ -263,8 +272,16 @@ fn eval_distance_recall_parallel(
     let mean_last_ratio = last_ratio_sum / (queries_f32.len() as f32);
     let mean_frac_returned = frac_returned_sum / (queries_f32.len() as f32);
 
-    println!("\nSearching {} queries with k={}, ef_search={} …\n", queries_f32.len(), k, ef_search);
-    println!(" mean fraction nb returned by search {}", mean_frac_returned);
+    println!(
+        "\nSearching {} queries with k={}, ef_search={} …\n",
+        queries_f32.len(),
+        k,
+        ef_search
+    );
+    println!(
+        " mean fraction nb returned by search {}",
+        mean_frac_returned
+    );
     println!(" last distances ratio {}", mean_last_ratio);
     println!(
         " distance recall@{}: {:.4}  | throughput: {:.0} q/s  — time: {:.3}s",
@@ -295,7 +312,7 @@ fn eval_distance_recall_single(
             .by_vector(&rtxn, q)
             .expect("hannoy search failed");
         let kth_sq = gt_d2[qi][k - 1];
-        let kth    = kth_sq.sqrt();              // for reporting
+        let kth = kth_sq.sqrt(); // for reporting
 
         // hannoy returns squared L2, compare directly to squared GT radius
         correct += res.iter().filter(|(_, d)| *d <= kth_sq).count();
@@ -313,8 +330,16 @@ fn eval_distance_recall_single(
     let mean_last_ratio = last_ratio_sum / (queries_f32.len() as f32);
     let mean_frac_returned = frac_returned_sum / (queries_f32.len() as f32);
 
-    println!("\nSearching {} queries with k={}, ef_search={} …\n", queries_f32.len(), k, ef_search);
-    println!(" mean fraction nb returned by search {}", mean_frac_returned);
+    println!(
+        "\nSearching {} queries with k={}, ef_search={} …\n",
+        queries_f32.len(),
+        k,
+        ef_search
+    );
+    println!(
+        " mean fraction nb returned by search {}",
+        mean_frac_returned
+    );
     println!(" last distances ratio {}", mean_last_ratio);
     println!(
         " distance recall@{}: {:.4}  | throughput: {:.0} q/s  — time: {:.3}s",
@@ -326,7 +351,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Toggle parallel vs single like your DiskANN example
     const PARALLEL: bool = true;
 
-    // Files
+    // Filenames in repo root
+    // download all data here: http://corpus-texmex.irisa.fr (ANN_SIFT1B)
     let base_path = "bigann_base.bvecs";
     let query_path = "bigann_query.bvecs";
     let gt_i_path = "idx_10M.ivecs";
@@ -351,8 +377,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 NB_DATA_POINTS, base_path
             );
             let t_load = Instant::now();
-            let base_u8 =
-                read_all_bvecs_prefix::<DIM>(base_path, NB_DATA_POINTS, 50_000).expect("read base failed");
+            let base_u8 = read_all_bvecs_prefix::<DIM>(base_path, NB_DATA_POINTS, 50_000)
+                .expect("read base failed");
             assert!(
                 base_u8.len() == NB_DATA_POINTS,
                 "requested {} base vectors, got {}",
@@ -383,7 +409,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Ground truth (10M): we only need dists^2 for distance recall
     println!("Reading ground truth from {}, {}…", gt_i_path, gt_f_path);
-    let (_gt_ids, gt_d2) = read_ground_truth(gt_i_path, gt_f_path, NB_QUERY).expect("failed reading GT");
+    let (_gt_ids, gt_d2) =
+        read_ground_truth(gt_i_path, gt_f_path, NB_QUERY).expect("failed reading GT");
     let kn = gt_d2[0].len();
     println!("GT loaded: {} queries, GT@{} per query", gt_d2.len(), kn);
 
