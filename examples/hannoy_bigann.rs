@@ -249,14 +249,14 @@ fn eval_distance_recall_parallel(
                 .expect("hannoy search failed");
 
             let kth_sq = gt_d2[qi][k - 1];
-            let kth    = kth_sq.sqrt();              // only for reporting
+            let kth    = kth_sq.sqrt();              // for reporting
 
             let returned = res.len();
-            // compare using squared distances
-            let correct_here = res.iter().filter(|(_, d)| (*d) * (*d) <= kth_sq).count();
+            // hannoy returns squared L2, compare directly to squared GT radius
+            let correct_here = res.iter().filter(|(_, d)| *d <= kth_sq).count();
 
             let last_ratio = if let Some((_, dlast)) = res.last() {
-                dlast / kth
+                dlast.sqrt() / kth
             } else {
                 0.0
             };
@@ -305,12 +305,12 @@ fn eval_distance_recall_single(
             .by_vector(&rtxn, q)
             .expect("hannoy search failed");
         let kth_sq = gt_d2[qi][k - 1];
-        let kth    = kth_sq.sqrt();              // only for reporting
+        let kth    = kth_sq.sqrt();              // for reporting
 
-        // compare using squared distances
-        correct += res.iter().filter(|(_, d)| (*d) * (*d) <= kth_sq).count();
+        // hannoy returns squared L2, compare directly to squared GT radius
+        correct += res.iter().filter(|(_, d)| *d <= kth_sq).count();
         if let Some((_, dlast)) = res.last() {
-            last_ratio_sum += dlast / kth;
+            last_ratio_sum += dlast.sqrt() / kth;
         }
         frac_returned_sum += (res.len() as f32) / (k as f32);
     }
