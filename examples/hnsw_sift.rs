@@ -62,7 +62,7 @@ pub fn main() {
         // build parameters
         let max_nb_connection = 48;
         let nb_layer = 16;
-        let ef_c = 1600;
+        let ef_c = 256;
 
         println!(
             "No saved index. Building new one: N={} layers={} ef_c={}",

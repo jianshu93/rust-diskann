@@ -160,6 +160,7 @@ wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
 cargo run --release --example diskann_sift
 ```
 
+
 ## Examples
 
 See the `examples/` directory for:
@@ -169,41 +170,134 @@ See the `examples/` directory for:
 - `diskann_sift.rs`: Performance benchmarking with SIFT 1M dataset
 - `bigann.rs`: Performance benchmarking with SIFT 10M dataset
 - `hnsw_sift.rs`: Comparison with in-memory HNSW
+- `hannoy_sift.rs`: Comparison with on-disk HNSW
 
-## Benchmark against in-memory HNSW ([hnsw_rs](https://crates.io/crates/hnsw_rs) crate)
+## Benchmark against in-memory HNSW ([hnsw_rs](https://crates.io/crates/hnsw_rs) crate) and on-disk HNSW ([hannoy](https://crates.io/crates/hannoy)) for SIFT 1 million dataset
+
 ```bash
-### MNIST fashion, diskann, M4 Max
-Building DiskANN index: n=60000, dim=784, max_degree=48, build_beam=256, alpha=1.2
-Build complete. CPU time: 1726.199372s, wall time: 111.145414s
-Searching 10000 queries with k=10, beam_width=384 …
+wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
+cargo run --release --example diskann_sift
+cargo run --release --example hnsw_sift
+cargo run --release --example hannoy_sift
+
+```
+
+Results:
+```bash
+## DiskANN,  sift1m , M4 Max
+DiskANN benchmark on "./sift-128-euclidean.hdf5"
+neighbours shape : [10000, 100]
+
+ 10 first neighbours for first vector : 
+ 932085  934876  561813  708177  706771  695756  435345  701258  455537  872728 
+ 10 first neighbours for second vector : 
+ 413247  413071  706838  880592  249062  400194  942339  880462  987636  941776  test data, nb element 10000,  dim : 128
+
+ train data shape : [1000000, 128], nbvector 1000000 
+ allocating vector for search neighbours answer : 10000
+Train size : 1000000
+Test size  : 10000
+Ground-truth k per query in file: 100
+
+Building DiskANN index: n=1000000, dim=128, max_degree=64, build_beam=128, alpha=1.2
+Build complete. CPU time: 4424.408064s, wall time: 294.704059s
+
+Searching 10000 queries with k=10, beam_width=512 …
+
  mean fraction nb returned by search 1.0
 
- last distances ratio 1.0031366
- recall rate for "./fashion-mnist-784-euclidean.hdf5" is 0.98838 , nb req /s 18067.664
+ last distances ratio 1.0002044
 
- total cpu time for search requests 8.520862s , system time 553.475ms
+ recall rate for "./sift-128-euclidean.hdf5" is 0.99591 , nb req /s 8590.497
+ total cpu time for search requests 15.077785s , system time 1.164077s
 
+ 
 
-### MNIST fashion, hnsw_rs, M4 Max
-parallel insertion
+###  sift1m, hnsw_rs, M4 Max
+neighbours shape : [10000, 100]
 
- hnsw data insertion cpu time  111.169283s  system time Ok(7.256291s) 
+ 10 first neighbours for first vector : 
+ 932085  934876  561813  708177  706771  695756  435345  701258  455537  872728 
+ 10 first neighbours for second vector : 
+ 413247  413071  706838  880592  249062  400194  942339  880462  987636  941776  test data, nb element 10000,  dim : 128
+
+ train data shape : [1000000, 128], nbvector 1000000 
+ allocating vector for search neighbours answer : 10000
+No saved index. Building new one: N=1000000 layers=16 ef_c=256
+
+  Current scale value : 2.58e-1, Scale modification factor asked : 5.00e-1,(modification factor must be between 2.00e-1 and 1.)
+ 
+ parallel insertion
+ setting number of points 50000 
+ setting number of points 100000 
+ setting number of points 150000 
+ setting number of points 200000 
+ setting number of points 250000 
+ setting number of points 300000 
+ setting number of points 350000 
+ setting number of points 400000 
+ setting number of points 450000 
+ setting number of points 500000 
+ setting number of points 550000 
+ setting number of points 600000 
+ setting number of points 650000 
+ setting number of points 700000 
+ setting number of points 750000 
+ setting number of points 800000 
+ setting number of points 850000 
+ setting number of points 900000 
+ setting number of points 950000 
+ setting number of points 1000000 
+HNSW index saved as: sift1m_l2_hnsw.hnsw.graph / .hnsw.data
+
+ hnsw data insertion cpu time  1447.190068s  system time Ok(95.761465s) 
  debug dump of PointIndexation
- layer 0 : length : 59999 
- layer 1 : length : 1 
+ layer 0 : length : 999596 
+ layer 1 : length : 403 
+ layer 2 : length : 1 
  debug dump of PointIndexation end
- hnsw data nb point inserted 60000
+ hnsw data nb point inserted 1000000
+searching with ef = 64
 
- searching with ef : 24
+
+ ef_search : 64 knbn : 10 
+searching with ef : 64
  
  parallel search
-total cpu time for search requests 3838.7310ms , system time 263.571ms 
+total cpu time for search requests 6140413.0 , system time Ok(405.2ms) 
 
  mean fraction nb returned by search 1.0 
 
- last distances ratio 1.0003573 
+ last distances ratio 1.0004181 
 
- recall rate for "./fashion-mnist-784-euclidean.hdf5" is 0.99054 , nb req /s 37940.44
+ recall rate for "./sift-128-euclidean.hdf5" is 0.98791 , nb req /s 24679.17
+
+
+### hannoy, on-disk hnsw
+
+hannoy × SIFT1M @ L2  -> "./sift-128-euclidean.hdf5"
+neighbours shape : [10000, 100]
+
+ 10 first neighbours for first vector : 
+ 932085  934876  561813  708177  706771  695756  435345  701258  455537  872728 
+ 10 first neighbours for second vector : 
+ 413247  413071  706838  880592  249062  400194  942339  880462  987636  941776  test data, nb element 10000,  dim : 128
+
+ train data shape : [1000000, 128], nbvector 1000000 
+ allocating vector for search neighbours answer : 10000
+Train size : 1000000
+Test size  : 10000
+Ground-truth k per query in file: 100
+Database present but needs build; building now…
+Building hannoy index: N=1000000, dim=128, M=48, M0=48, ef_c=256
+hannoy build complete. CPU time: 1149.622047s, wall time: 76.101147s
+
+Searching 10000 queries with k=10, ef_search=64 …
+ distance recall@10  : 0.9803
+ last distances ratio (ours true L2 / GT kth): 1.0007
+ throughput: 11000 q/s — cpu: 14.334211s  wall: 909.061ms
+
+
 
 ```
 

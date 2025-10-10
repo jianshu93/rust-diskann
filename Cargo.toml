@@ -1,6 +1,6 @@
 [package]
 name = "rust-diskann"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/jianshu93/rust-diskann"
 description = "A native Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search)"
@@ -37,3 +37,5 @@ hdf5 = {package = "hdf5-metno", version = "0.10.0" }
 cpu-time = "1.0.0"
 byteorder = "1.5.0"
 hnsw_rs = {version = "0.3.2", default-features = false, features = ["stdsimd"]}
+hannoy = { git = "https://github.com/jianshu93/hannoy" }
+heed = { version = "0.22.0", default-features = false }
