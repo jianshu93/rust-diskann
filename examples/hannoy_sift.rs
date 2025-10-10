@@ -239,8 +239,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search_sys_time_us = wall_time.as_micros() as f32;
     let req_per_s = (nb_search as f32) * 1.0e6_f32 / search_sys_time_us;
 
-    println!("\n id-overlap recall@{}: {:.4}", k, mean_id_recall);
-    // println!(" distance recall@{}  : {:.4}", k, mean_dist_recall);
+    //println!("\n id-overlap recall@{}: {:.4}", k, mean_id_recall);
+    println!(" distance recall@{}  : {:.4}", k, mean_dist_recall);
     println!(" last distances ratio (ours true L2 / GT kth): {:.4}", mean_last_ratio);
     println!(
         " throughput: {:.0} q/s — cpu: {:?}  wall: {:?}",
