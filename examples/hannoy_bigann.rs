@@ -42,8 +42,6 @@ const EF_CONSTRUCTION: usize = 160;
 // Search knob (analogous to DiskANN beam width)
 const EF_SEARCH: usize = 512;
 
-// ------------------------ I/O helpers ------------------------
-
 fn read_bvecs_block<const SIZE: usize>(
     r: &mut BufReader<File>,
     max_points: usize,
@@ -151,8 +149,6 @@ fn u8s_to_f32(v: &[u8]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
 
-// ------------------------ LMDB / Hannoy ------------------------
-
 fn ensure_dir(path: &Path) -> io::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)?;
@@ -219,8 +215,6 @@ fn build_and_open_reader(
     drop(rtxn);
     Ok(reader)
 }
-
-// ------------------------ Evaluation (distance-based recall) ------------------------
 
 fn eval_distance_recall_parallel(
     env: &Env,
@@ -327,8 +321,6 @@ fn eval_distance_recall_single(
         k, recall, qps, secs
     );
 }
-
-// ------------------------ Main ------------------------
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Toggle parallel vs single like your DiskANN example
