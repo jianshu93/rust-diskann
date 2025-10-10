@@ -43,6 +43,8 @@ const EF_CONSTRUCTION: usize = 160;
 // Search knob (analogous to DiskANN beam width)
 const EF_SEARCH: usize = 512;
 
+// ------------------------ I/O helpers ------------------------
+
 fn read_bvecs_block<const SIZE: usize>(
     r: &mut BufReader<File>,
     max_points: usize,
@@ -150,7 +152,7 @@ fn u8s_to_f32(v: &[u8]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
 
-// LMDB / hannoy 
+// ------------------------ LMDB / Hannoy ------------------------
 
 fn ensure_dir(path: &Path) -> io::Result<()> {
     if !path.exists() {
@@ -174,57 +176,57 @@ fn open_env(dir: &Path) -> heed::Result<Env> {
     }
 }
 
-/// Try to open a Reader; if NeedBuild, load vectors and build, then reopen.
-/// We **don't** return any transaction to avoid generic TLS mismatches.
+/// Try to open a Reader; if NeedBuild **or MissingMetadata**, build, then reopen.
+/// We **don’t** return the transaction (RoTxn is !Send/!Sync).
 fn open_or_build_reader(
     env: &Env,
     dim: usize,
     vectors: Option<&[Vec<f32>]>, // must be Some when building
 ) -> Result<(Reader<Euclidean>, Database<Euclidean>), Box<dyn Error>> {
-    // Create (or open) the database handle
+    // Create (or open) the database handle.
     let mut wtxn = env.write_txn()?;
     let db: Database<Euclidean> = env.create_database(&mut wtxn, None)?;
     wtxn.commit()?;
 
-    // Try read-only open
+    // Try read-only open.
     let rtxn = env.read_txn()?;
     match Reader::<Euclidean>::open(&rtxn, 0, db.clone()) {
         Ok(reader) => {
             drop(rtxn);
             return Ok((reader, db));
         }
-        Err(HannoyError::NeedBuild(_)) => {
+        // IMPORTANT: treat MissingMetadata like "needs build" on a fresh store
+        Err(HannoyError::NeedBuild(_)) | Err(HannoyError::MissingMetadata(_)) => {
             drop(rtxn);
         }
         Err(e) => return Err(e.into()),
     }
 
-    // Need to build
+    // Need to build.
     let vectors = vectors.expect("vectors must be provided when building");
     let mut wtxn = env.write_txn()?;
     let writer: Writer<Euclidean> = Writer::new(db.clone(), 0, dim);
 
-    // Insert vectors
     for (id, vecf) in vectors.iter().enumerate() {
         writer.add_item(&mut wtxn, id as u32, vecf)?;
     }
 
-    // Build HNSW
+    // Build HNSW.
     let mut rng = StdRng::seed_from_u64(42);
     let mut builder = writer.builder(&mut rng);
     builder.ef_construction(EF_CONSTRUCTION).build::<M, M0>(&mut wtxn)?;
     wtxn.commit()?;
 
-    // Reopen
+    // Reopen.
     let rtxn = env.read_txn()?;
     let reader = Reader::<Euclidean>::open(&rtxn, 0, db.clone())?;
     drop(rtxn);
     Ok((reader, db))
 }
 
-// Evaluation (distance-based recall)
+// ------------------------ Evaluation (distance-based recall) ------------------------
 
-fn eval_recall_parallel(
+fn eval_distance_recall_parallel(
     env: &Env,
     reader: &Reader<Euclidean>,
     queries_f32: &[Vec<f32>],
@@ -277,7 +279,7 @@ fn eval_recall_parallel(
     );
 }
 
-fn eval_recall_single(
+fn eval_distance_recall_single(
     env: &Env,
     reader: &Reader<Euclidean>,
     queries_f32: &[Vec<f32>],
@@ -382,11 +384,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Distance-based recall
     if PARALLEL {
-        eval_recall_parallel(&env, &reader, &queries_f32, &gt_d2, 10, EF_SEARCH);
-        eval_recall_parallel(&env, &reader, &queries_f32, &gt_d2, 100, EF_SEARCH);
+        eval_distance_recall_parallel(&env, &reader, &queries_f32, &gt_d2, 10, EF_SEARCH);
+        eval_distance_recall_parallel(&env, &reader, &queries_f32, &gt_d2, 100, EF_SEARCH);
     } else {
-        eval_recall_single(&env, &reader, &queries_f32, &gt_d2, 10, EF_SEARCH);
-        eval_recall_single(&env, &reader, &queries_f32, &gt_d2, 100, EF_SEARCH);
+        eval_distance_recall_single(&env, &reader, &queries_f32, &gt_d2, 10, EF_SEARCH);
+        eval_distance_recall_single(&env, &reader, &queries_f32, &gt_d2, 100, EF_SEARCH);
     }
 
     Ok(())
