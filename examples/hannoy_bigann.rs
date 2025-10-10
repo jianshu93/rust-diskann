@@ -20,8 +20,6 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-// ------------------------ Config ------------------------
-
 const DIM: usize = 128;
 
 // How many base vectors to ingest from bigann_base.bvecs (use your shard size).
@@ -37,13 +35,11 @@ const LMDB_DIR: &str = "hannoy_bigann.lmdb";
 const DEFAULT_MAP_SIZE_BYTES: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
 
 // Hannoy build/search knobs (align with your SIFT runs)
-const M: usize = 16;
-const M0: usize = 32;
-const EF_CONSTRUCTION: usize = 160;
+const M: usize = 48;
+const M0: usize = 64;
+const EF_CONSTRUCTION: usize = 256;
 // Search knob (analogous to DiskANN beam width)
 const EF_SEARCH: usize = 512;
-
-// ------------------------ I/O helpers ------------------------
 
 fn read_bvecs_block<const SIZE: usize>(
     r: &mut BufReader<File>,
@@ -152,7 +148,6 @@ fn u8s_to_f32(v: &[u8]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
 
-// ------------------------ LMDB / Hannoy ------------------------
 
 fn ensure_dir(path: &Path) -> io::Result<()> {
     if !path.exists() {
@@ -223,8 +218,6 @@ fn open_or_build_reader(
     drop(rtxn);
     Ok((reader, db))
 }
-
-// ------------------------ Evaluation (distance-based recall) ------------------------
 
 fn eval_distance_recall_parallel(
     env: &Env,
@@ -331,8 +324,6 @@ fn eval_distance_recall_single(
         k, recall, qps, secs
     );
 }
-
-// ------------------------ Main ------------------------
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Toggle parallel vs single like your DiskANN example
