@@ -1,13 +1,12 @@
 //! hannoy_bigann.rs — Hannoy on BigANN with distance-based recall@k (parallel or single-threaded)
-//!
-//! Expected files in repo root (10M GT subset from ANN_SIFT1B):
-//!   - bigann_base.bvecs
-//!   - bigann_query.bvecs
-//!   - idx_10M.ivecs
-//!   - dis_10M.fvecs   (squared L2; we sqrt kth for distance recall)
-//!
-//! Builds (or reuses) an LMDB-backed hannoy index in ./hannoy_bigann.lmdb,
-//! then evaluates recall@10 and recall@100 on NB_QUERY queries.
+//
+// Expected files in repo root (10M GT subset from ANN_SIFT1B):
+//   - bigann_base.bvecs
+//   - bigann_query.bvecs
+//   - idx_10M.ivecs
+//   - dis_10M.fvecs   (squared L2; we compare using squared distances)
+// Builds (or reuses) an LMDB-backed hannoy index in ./hannoy_bigann.lmdb,
+// then evaluates recall@10 and recall@100 on NB_QUERY queries.
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use heed::{Env, EnvOpenOptions};
@@ -19,6 +18,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+// ------------------------ Config ------------------------
 
 const DIM: usize = 128;
 
@@ -35,11 +36,13 @@ const LMDB_DIR: &str = "hannoy_bigann.lmdb";
 const DEFAULT_MAP_SIZE_BYTES: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
 
 // Hannoy build/search knobs (align with your SIFT runs)
-const M: usize = 48;
-const M0: usize = 64;
-const EF_CONSTRUCTION: usize = 256;
+const M: usize = 16;
+const M0: usize = 32;
+const EF_CONSTRUCTION: usize = 160;
 // Search knob (analogous to DiskANN beam width)
 const EF_SEARCH: usize = 512;
+
+// ------------------------ I/O helpers ------------------------
 
 fn read_bvecs_block<const SIZE: usize>(
     r: &mut BufReader<File>,
@@ -148,6 +151,7 @@ fn u8s_to_f32(v: &[u8]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
 
+// ------------------------ LMDB / Hannoy ------------------------
 
 fn ensure_dir(path: &Path) -> io::Result<()> {
     if !path.exists() {
@@ -171,34 +175,33 @@ fn open_env(dir: &Path) -> heed::Result<Env> {
     }
 }
 
-/// Try to open a Reader; if NeedBuild **or MissingMetadata**, build, then reopen.
-/// We **don’t** return the transaction (RoTxn is !Send/!Sync).
-fn open_or_build_reader(
-    env: &Env,
-    dim: usize,
-    vectors: Option<&[Vec<f32>]>, // must be Some when building
-) -> Result<(Reader<Euclidean>, Database<Euclidean>), Box<dyn Error>> {
-    // Create (or open) the database handle.
+/// Try to open a Reader; if NeedBuild/MissingMetadata, return Ok(None).
+fn try_open_reader(env: &Env) -> Result<Option<(Reader<Euclidean>, Database<Euclidean>)>, Box<dyn Error>> {
     let mut wtxn = env.write_txn()?;
     let db: Database<Euclidean> = env.create_database(&mut wtxn, None)?;
     wtxn.commit()?;
 
-    // Try read-only open.
     let rtxn = env.read_txn()?;
     match Reader::<Euclidean>::open(&rtxn, 0, db.clone()) {
         Ok(reader) => {
             drop(rtxn);
-            return Ok((reader, db));
+            Ok(Some((reader, db)))
         }
-        // IMPORTANT: treat MissingMetadata like "needs build" on a fresh store
         Err(HannoyError::NeedBuild(_)) | Err(HannoyError::MissingMetadata(_)) => {
             drop(rtxn);
+            Ok(None)
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => Err(e.into()),
     }
+}
 
-    // Need to build.
-    let vectors = vectors.expect("vectors must be provided when building");
+/// Build the index from vectors, then reopen a Reader.
+fn build_and_open_reader(
+    env: &Env,
+    db: &Database<Euclidean>,
+    dim: usize,
+    vectors: &[Vec<f32>],
+) -> Result<Reader<Euclidean>, Box<dyn Error>> {
     let mut wtxn = env.write_txn()?;
     let writer: Writer<Euclidean> = Writer::new(db.clone(), 0, dim);
 
@@ -206,24 +209,24 @@ fn open_or_build_reader(
         writer.add_item(&mut wtxn, id as u32, vecf)?;
     }
 
-    // Build HNSW.
     let mut rng = StdRng::seed_from_u64(42);
     let mut builder = writer.builder(&mut rng);
     builder.ef_construction(EF_CONSTRUCTION).build::<M, M0>(&mut wtxn)?;
     wtxn.commit()?;
 
-    // Reopen.
     let rtxn = env.read_txn()?;
     let reader = Reader::<Euclidean>::open(&rtxn, 0, db.clone())?;
     drop(rtxn);
-    Ok((reader, db))
+    Ok(reader)
 }
+
+// ------------------------ Evaluation (distance-based recall) ------------------------
 
 fn eval_distance_recall_parallel(
     env: &Env,
     reader: &Reader<Euclidean>,
     queries_f32: &[Vec<f32>],
-    gt_d2: &[Vec<f32>], // squared L2; we sqrt kth
+    gt_d2: &[Vec<f32>], // squared L2; we compare in squared space
     k: usize,
     ef_search: usize,
 ) {
@@ -325,6 +328,8 @@ fn eval_distance_recall_single(
     );
 }
 
+// ------------------------ Main ------------------------
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Toggle parallel vs single like your DiskANN example
     const PARALLEL: bool = true;
@@ -340,41 +345,53 @@ fn main() -> Result<(), Box<dyn Error>> {
     ensure_dir(&lmdb_dir)?;
     let env = open_env(&lmdb_dir)?;
 
-    // Read base (needed if we must build)
-    println!(
-        "Reading {} base vectors from {} …",
-        NB_DATA_POINTS, base_path
-    );
-    let t_load = Instant::now();
-    let base_u8 =
-        read_all_bvecs_prefix::<DIM>(base_path, NB_DATA_POINTS, 50_000).expect("read base failed");
-    assert!(
-        base_u8.len() == NB_DATA_POINTS,
-        "requested {} base vectors, got {}",
-        NB_DATA_POINTS,
-        base_u8.len()
-    );
-    let vectors_f32: Vec<Vec<f32>> = base_u8.iter().map(|v| u8s_to_f32(v)).collect();
-    println!(
-        "Loaded {} vectors in {:.1}s",
-        vectors_f32.len(),
-        t_load.elapsed().as_secs_f32()
-    );
-
-    // Open (or build then open) reader
+    // Try to open existing index first (no base read).
     println!("Opening hannoy DB at {} …", LMDB_DIR);
-    let (reader, _db) = open_or_build_reader(&env, DIM, Some(&vectors_f32))?;
+    let (reader, db) = match try_open_reader(&env)? {
+        Some((reader, db)) => {
+            println!("Found existing hannoy index; skipping base load.");
+            (reader, db)
+        }
+        None => {
+            // Need to build: load base vectors now.
+            println!(
+                "No index or needs build; reading {} base vectors from {} …",
+                NB_DATA_POINTS, base_path
+            );
+            let t_load = Instant::now();
+            let base_u8 =
+                read_all_bvecs_prefix::<DIM>(base_path, NB_DATA_POINTS, 50_000).expect("read base failed");
+            assert!(
+                base_u8.len() == NB_DATA_POINTS,
+                "requested {} base vectors, got {}",
+                NB_DATA_POINTS,
+                base_u8.len()
+            );
+            let vectors_f32: Vec<Vec<f32>> = base_u8.iter().map(|v| u8s_to_f32(v)).collect();
+            println!(
+                "Loaded {} vectors in {:.1}s; building…",
+                vectors_f32.len(),
+                t_load.elapsed().as_secs_f32()
+            );
+
+            // Create/open the database handle for the build
+            let mut wtxn = env.write_txn()?;
+            let db: Database<Euclidean> = env.create_database(&mut wtxn, None)?;
+            wtxn.commit()?;
+
+            let reader = build_and_open_reader(&env, &db, DIM, &vectors_f32)?;
+            (reader, db)
+        }
+    };
 
     // Queries
     println!("Reading first {} queries from {}…", NB_QUERY, query_path);
-    let queries_u8 =
-        read_query_bvecs::<DIM>(query_path, NB_QUERY).expect("failed reading queries");
+    let queries_u8 = read_query_bvecs::<DIM>(query_path, NB_QUERY).expect("failed reading queries");
     let queries_f32: Vec<Vec<f32>> = queries_u8.iter().map(|v| u8s_to_f32(v)).collect();
 
     // Ground truth (10M): we only need dists^2 for distance recall
     println!("Reading ground truth from {}, {}…", gt_i_path, gt_f_path);
-    let (_gt_ids, gt_d2) =
-        read_ground_truth(gt_i_path, gt_f_path, NB_QUERY).expect("failed reading GT");
+    let (_gt_ids, gt_d2) = read_ground_truth(gt_i_path, gt_f_path, NB_QUERY).expect("failed reading GT");
     let kn = gt_d2[0].len();
     println!("GT loaded: {} queries, GT@{} per query", gt_d2.len(), kn);
 
@@ -386,6 +403,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         eval_distance_recall_single(&env, &reader, &queries_f32, &gt_d2, 10, EF_SEARCH);
         eval_distance_recall_single(&env, &reader, &queries_f32, &gt_d2, 100, EF_SEARCH);
     }
+
+    // Prevent unused warning in case you add mutations later
+    let _ = db;
 
     Ok(())
 }
