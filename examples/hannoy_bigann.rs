@@ -248,9 +248,12 @@ fn eval_distance_recall_parallel(
                 .by_vector(&rtxn, q)
                 .expect("hannoy search failed");
 
-            let kth = gt_d2[qi][k - 1].sqrt();
+            let kth_sq = gt_d2[qi][k - 1];
+            let kth    = kth_sq.sqrt();              // only for reporting
+
             let returned = res.len();
-            let correct_here = res.iter().filter(|(_, d)| *d <= kth).count();
+            // compare using squared distances
+            let correct_here = res.iter().filter(|(_, d)| (*d) * (*d) <= kth_sq).count();
 
             let last_ratio = if let Some((_, dlast)) = res.last() {
                 dlast / kth
@@ -301,9 +304,11 @@ fn eval_distance_recall_single(
             .ef_search(ef_search)
             .by_vector(&rtxn, q)
             .expect("hannoy search failed");
-        let kth = gt_d2[qi][k - 1].sqrt();
+        let kth_sq = gt_d2[qi][k - 1];
+        let kth    = kth_sq.sqrt();              // only for reporting
 
-        correct += res.iter().filter(|(_, d)| *d <= kth).count();
+        // compare using squared distances
+        correct += res.iter().filter(|(_, d)| (*d) * (*d) <= kth_sq).count();
         if let Some((_, dlast)) = res.last() {
             last_ratio_sum += dlast / kth;
         }
