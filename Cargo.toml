@@ -2,9 +2,10 @@
 name = "rust-diskann"
 version = "0.2.1"
 edition = "2024"
+authors = ["Jianshu Zhao <jianshuzhao@yahoo.com>"]
 repository = "https://github.com/jianshu93/rust-diskann"
 description = "A native Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search)"
-license = "MIT" 
+license = "MIT OR Apache-2.0" 
 keywords = [
     "similarity-search",
     "Vector-Search",
