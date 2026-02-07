@@ -30,7 +30,7 @@ thiserror = "1.0"
 bytemuck = "1.14"
 rayon = "1.10"
 ndarray = { version = "0.16" }
-anndists = {version = "0.1.3", default-features = false, features = ["stdsimd"]}
+anndists = { git = "https://github.com/jianshu93/anndists", features = ["stdsimd"] }
 log = { version = "0.4" }
 
 [dev-dependencies]

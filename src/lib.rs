@@ -799,7 +799,7 @@ fn build_incoming_csr(order: &[usize], new_graph: &[Vec<u32>], n: usize) -> (Vec
             indeg[v as usize] += 1;
         }
     }
-    // 2) prefix sums → offsets
+    // 2) prefix sums to offsets
     let mut off = vec![0usize; n + 1];
     for i in 0..n {
         off[i + 1] = off[i] + indeg[i];
