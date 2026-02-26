@@ -762,7 +762,9 @@ where
         let mut ok = true;
         for &sel in &pruned {
             let d = dist.eval(&vectors[cand_id as usize], &vectors[sel as usize]);
-            if d < alpha * cand_dist {
+            // DiskANN / Vamana-style robust prune:
+            // prune cand_id if alpha * f(u,w) <= f(v,w)
+            if alpha * d <= cand_dist {
                 ok = false;
                 break;
             }

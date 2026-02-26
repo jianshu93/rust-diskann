@@ -35,6 +35,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "anndists"
+version = "0.1.4"
+source = "git+https://github.com/jianshu93/anndists#4a13ad2093fea59f4ea9c19e419c1361da02ac66"
+dependencies = [
+ "anyhow",
+ "cfg-if",
+ "cpu-time",
+ "env_logger",
+ "lazy_static",
+ "log",
+ "num-traits",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "anstream"
 version = "0.6.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -504,7 +520,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b53dc5b9b07424143d016ba843c9b510f424e239118697f5d5d582f2d437df41"
 dependencies = [
- "anndists",
+ "anndists 0.1.3",
  "anyhow",
  "bincode",
  "cfg-if",
@@ -1218,7 +1234,7 @@ dependencies = [
 name = "rust-diskann"
 version = "0.2.1"
 dependencies = [
- "anndists",
+ "anndists 0.1.4",
  "bincode",
  "bytemuck",
  "byteorder",
