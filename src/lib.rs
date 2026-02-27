@@ -54,6 +54,10 @@ const PAD_U32: u32 = u32::MAX;
 pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
 pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
+/// Default number of refinement passes during graph build
+pub const DISKANN_DEFAULT_PASSES: usize = 2;
+/// Default number of extra random seeds per node per pass during graph build
+pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 2;
 
 /// Optional bag of knobs if you want to override just a few.
 #[derive(Clone, Copy, Debug)]
@@ -61,13 +65,20 @@ pub struct DiskAnnParams {
     pub max_degree: usize,
     pub build_beam_width: usize,
     pub alpha: f32,
+    /// Number of refinement passes over the graph (>=1).
+    pub passes: usize,
+    /// Extra random seeds per node during each pass (>=0).
+    pub extra_seeds: usize,
 }
+
 impl Default for DiskAnnParams {
     fn default() -> Self {
         Self {
             max_degree: DISKANN_DEFAULT_MAX_DEGREE,
             build_beam_width: DISKANN_DEFAULT_BUILD_BEAM,
             alpha: DISKANN_DEFAULT_ALPHA,
+            passes: DISKANN_DEFAULT_PASSES,
+            extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
         }
     }
 }
@@ -162,7 +173,7 @@ where
     T: bytemuck::Pod + Copy + Send + Sync + 'static,
     D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
-    /// Build with default parameters: (M=64, L=128, alpha=1.2).
+    /// Build with default parameters: (M=64, L=128, alpha=1.2, passes=2, extra_seeds=2).
     pub fn build_index_default(
         vectors: &[Vec<T>],
         dist: D,
@@ -173,6 +184,8 @@ where
             DISKANN_DEFAULT_MAX_DEGREE,
             DISKANN_DEFAULT_BUILD_BEAM,
             DISKANN_DEFAULT_ALPHA,
+            DISKANN_DEFAULT_PASSES,
+            DISKANN_DEFAULT_EXTRA_SEEDS,
             dist,
             file_path,
         )
@@ -190,6 +203,8 @@ where
             p.max_degree,
             p.build_beam_width,
             p.alpha,
+            p.passes,
+            p.extra_seeds,
             dist,
             file_path,
         )
@@ -277,6 +292,8 @@ where
     /// * `max_degree` - Maximum edges per node (M ~ 24-64+)
     /// * `build_beam_width` - Construction L (e.g., 128-400)
     /// * `alpha` - Pruning parameter (1.2–2.0)
+    /// * `passes` - Refinement passes over the graph (>=1)
+    /// * `extra_seeds` - Extra random seeds per node per pass (>=0)
     /// * `dist` - Any `anndists::Distance<T>`
     /// * `file_path` - Path of index file
     pub fn build_index(
@@ -284,6 +301,8 @@ where
         max_degree: usize,
         build_beam_width: usize,
         alpha: f32,
+        passes: usize,
+        extra_seeds: usize,
         dist: D,
         file_path: &str,
     ) -> Result<Self, DiskAnnError> {
@@ -340,6 +359,8 @@ where
             max_degree,
             build_beam_width,
             alpha,
+            passes,
+            extra_seeds,
             dist,
             medoid_id as u32,
         );
@@ -524,12 +545,14 @@ where
 /// Builds a strengthened Vamana-like graph using multi-pass refinement.
 /// - Multi-seed candidate gathering (medoid and random seeds)
 /// - Union with current adjacency before α-prune
-/// - 2 refinement passes with symmetrization after each pass
+/// - `passes` refinement passes with symmetrization after each pass
 fn build_vamana_graph<T, D>(
     vectors: &[Vec<T>],
     max_degree: usize,
     build_beam_width: usize,
     alpha: f32,
+    passes: usize,
+    extra_seeds: usize,
     dist: D,
     medoid_id: u32,
 ) -> Vec<Vec<u32>>
@@ -556,12 +579,10 @@ where
         }
     }
 
-    // Refinement passes
-    const PASSES: usize = 2;
-    const EXTRA_SEEDS: usize = 2;
+    let passes = passes.max(1); // at least one pass is sensible
 
     let mut rng = thread_rng();
-    for _pass in 0..PASSES {
+    for _pass in 0..passes {
         // Shuffle visit order each pass
         let mut order: Vec<usize> = (0..n).collect();
         order.shuffle(&mut rng);
@@ -574,7 +595,7 @@ where
             .par_iter()
             .map(|&u| {
                 let mut candidates: Vec<(u32, f32)> =
-                    Vec::with_capacity(build_beam_width * (2 + EXTRA_SEEDS));
+                    Vec::with_capacity(build_beam_width * (2 + extra_seeds));
 
                 // Include current adjacency with distances
                 for &nb in &snapshot[u] {
@@ -583,10 +604,10 @@ where
                 }
 
                 // Seeds: always medoid + some random starts
-                let mut seeds = Vec::with_capacity(1 + EXTRA_SEEDS);
+                let mut seeds = Vec::with_capacity(1 + extra_seeds);
                 seeds.push(medoid_id as usize);
                 let mut trng = thread_rng();
-                for _ in 0..EXTRA_SEEDS {
+                for _ in 0..extra_seeds {
                     seeds.push(trng.gen_range(0..n));
                 }
 
@@ -904,7 +925,8 @@ mod tests {
         ];
 
         {
-            let _idx = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
+            let _idx =
+                DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
         }
 
         // Use the default-metric opener (D: Default), keeping the same T
@@ -941,6 +963,8 @@ mod tests {
                 max_degree: 4,
                 build_beam_width: 64,
                 alpha: 1.5,
+                passes: DISKANN_DEFAULT_PASSES,
+                extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
             },
         )
         .unwrap();
@@ -981,6 +1005,8 @@ mod tests {
                 max_degree: 32,
                 build_beam_width: 128,
                 alpha: 1.2,
+                passes: DISKANN_DEFAULT_PASSES,
+                extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
             },
         )
         .unwrap();

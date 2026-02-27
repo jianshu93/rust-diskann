@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use rust_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
 mod utils;
 use utils::*;
 
@@ -39,6 +40,9 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 48;
     let build_beam_width = 128; // smaller beam for faster build (64–128)
     let alpha = 1.2; // standard α
+    let passes = 2usize; // refinement passes over the graph
+    let extra_seeds = 2usize; // extra random seeds per node per pass
+
     let search_k = 10; // evaluate @k=10 (matches HNSW example)
     let search_beam = 384; // search beam: speed/recall tradeoff
 
@@ -54,18 +58,23 @@ fn main() -> Result<(), DiskAnnError> {
     let index_path = "diskann_mnist.db";
     let index = if !std::path::Path::new(index_path).exists() {
         println!(
-            "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, build_beam={}, alpha={}",
+            "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, \
+             build_beam={}, alpha={}, passes={}, extra_seeds={}",
             train_vectors.len(),
             train_vectors[0].len(),
             max_degree,
             build_beam_width,
-            alpha
+            alpha,
+            passes,
+            extra_seeds
         );
 
         let params = DiskAnnParams {
             max_degree,
             build_beam_width,
             alpha,
+            passes,
+            extra_seeds,
         };
 
         let start_cpu = ProcessTime::now();

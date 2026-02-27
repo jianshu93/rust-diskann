@@ -125,16 +125,21 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 64;
     let build_beam_width = 128;
     let alpha = 1.2;
+    let passes = 2usize;      // refinement passes over the graph
+    let extra_seeds = 2usize; // extra random seeds per node per pass
 
     let index_path = "diskann_sift1m.db";
     let index = if !std::path::Path::new(index_path).exists() {
         println!(
-            "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, build_beam={}, alpha={}",
+            "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, \
+             build_beam={}, alpha={}, passes={}, extra_seeds={}",
             nb_elem,
             anndata.train_data[0].0.len(),
             max_degree,
             build_beam_width,
-            alpha
+            alpha,
+            passes,
+            extra_seeds
         );
 
         // Clone the training matrix ONLY when we actually need to build.
@@ -148,6 +153,8 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree,
             build_beam_width,
             alpha,
+            passes,
+            extra_seeds,
         };
 
         let start_cpu = ProcessTime::now();
@@ -192,20 +199,9 @@ fn main() -> Result<(), DiskAnnError> {
         idx
     };
 
-    // OPTIONAL BIG WIN:
-    // If you want to free *everything* from anndata except what's needed for recall:
-    // let test_data = std::mem::take(&mut anndata.test_data);           // moves Vec out
-    // let test_distances = anndata.test_distances.clone();              // keep GT (or take if movable)
-    // let fname_label = anndata.fname.clone();
-    // drop(anndata);                                                    // FREE HERE #4: drop the whole loader
-    // Then change run_search signature to accept (&test_data, &test_distances, &fname_label).
-
     let index = Arc::new(index);
 
-    // If per-thread scratch is heavy, limit threads (helps RSS):
-    // std::env::set_var("RAYON_NUM_THREADS", "8");
-
-    // Evaluate at k=10, beam 256
+    // Evaluate at k=10, beam 512
     let k = 10.min(knbn_max);
     run_search(&index, &anndata, k, 512);
 

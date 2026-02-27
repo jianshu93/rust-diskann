@@ -4,7 +4,6 @@ use cpu_time::ProcessTime;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use anndists::dist::*;
 use log::info;
 
 use hnsw_rs::hnswio::HnswIo;

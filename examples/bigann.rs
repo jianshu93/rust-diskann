@@ -14,7 +14,9 @@
 use anndists::dist::DistL2;
 use byteorder::{LittleEndian, ReadBytesExt};
 use rayon::prelude::*;
-use rust_diskann::{DiskANN, DiskAnnParams};
+use rust_diskann::{
+    DiskANN, DiskAnnParams, DISKANN_DEFAULT_EXTRA_SEEDS, DISKANN_DEFAULT_PASSES,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
@@ -37,6 +39,8 @@ const DISKANN_PARAMS: DiskAnnParams = DiskAnnParams {
     max_degree: 96,
     build_beam_width: 192,
     alpha: 1.2,
+    passes: DISKANN_DEFAULT_PASSES,
+    extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
 };
 const BEAM_SEARCH: usize = 512;
 
@@ -193,6 +197,14 @@ fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> Di
         "Loaded {} vectors in {:.1}s; building DiskANN…",
         vectors.len(),
         t0.elapsed().as_secs_f32()
+    );
+    println!(
+        "DiskANN build params: max_degree={}, build_beam_width={}, alpha={}, passes={}, extra_seeds={}",
+        DISKANN_PARAMS.max_degree,
+        DISKANN_PARAMS.build_beam_width,
+        DISKANN_PARAMS.alpha,
+        DISKANN_PARAMS.passes,
+        DISKANN_PARAMS.extra_seeds
     );
 
     let t1 = Instant::now();
