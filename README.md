@@ -56,6 +56,9 @@ let params = DiskAnnParams {
     max_degree: 48,        // max neighbors per node
     build_beam_width: 128, // construction beam width
     alpha: 1.2,            // α for pruning
+    passes: 2,             // number of initial passes 
+    extra_seeds: 2,        // number of extra refinement
+
 };
 let index2 = DiskANN::<f32, DistCosine>::build_index_with_params(
     &vectors,
