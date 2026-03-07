@@ -41,7 +41,7 @@ use rand::{prelude::*, thread_rng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -719,7 +719,7 @@ where
     T: bytemuck::Pod + Copy + Send + Sync,
     D: Distance<T> + Copy,
 {
-    let mut visited = HashSet::new();
+    let mut visited: HashMap<u32, f32> = HashMap::new();
     let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
     let mut w: BinaryHeap<Candidate> = BinaryHeap::new();
 
@@ -730,7 +730,7 @@ where
     };
     frontier.push(Reverse(start));
     w.push(start);
-    visited.insert(start_id as u32);
+    visited.insert(start_id as u32, start_dist);
 
     while let Some(Reverse(best)) = frontier.peek().copied() {
         if w.len() >= beam_width {
@@ -740,14 +740,17 @@ where
                 }
             }
         }
+
         let Reverse(cur) = frontier.pop().unwrap();
 
         for &nb in &graph[cur.id as usize] {
-            if !visited.insert(nb) {
+            if visited.contains_key(&nb) {
                 continue;
             }
 
             let d = dist.eval(query, &vectors[nb as usize]);
+            visited.insert(nb, d);
+
             let cand = Candidate { dist: d, id: nb };
 
             if w.len() < beam_width {
@@ -761,11 +764,7 @@ where
         }
     }
 
-    let mut out: Vec<(u32, f32)> = visited
-        .into_iter()
-        .map(|id| (id, dist.eval(query, &vectors[id as usize])))
-        .collect();
-
+    let mut out: Vec<(u32, f32)> = visited.into_iter().collect();
     out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     out
 }
