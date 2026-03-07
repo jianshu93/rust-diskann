@@ -580,10 +580,11 @@ where
             graph[i] = s.into_iter().collect();
         }
     }
-    
+
     let passes = passes.max(1); // at least one pass is sensible
 
     let mut rng = thread_rng();
+    // two passes, first with α = 1, second with user α > 1 (1.2 by default)
     for pass_idx in 0..passes {
         let pass_alpha = if passes == 1 {
             alpha
