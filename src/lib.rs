@@ -563,12 +563,14 @@ where
     let n = vectors.len();
     let mut graph = vec![Vec::<u32>::new(); n];
 
-    // Light random bootstrap to avoid disconnected starts
+    // Random R-out directed graph bootstrap: each node gets exactly max_degree
+    // distinct random out-neighbors (or n-1 if the dataset is smaller).
     {
         let mut rng = thread_rng();
+        let target = max_degree.min(n.saturating_sub(1));
+
         for i in 0..n {
-            let mut s = HashSet::new();
-            let target = (max_degree / 2).max(2).min(n.saturating_sub(1));
+            let mut s = HashSet::with_capacity(target);
             while s.len() < target {
                 let nb = rng.gen_range(0..n);
                 if nb != i {
@@ -578,11 +580,19 @@ where
             graph[i] = s.into_iter().collect();
         }
     }
-
+    
     let passes = passes.max(1); // at least one pass is sensible
 
     let mut rng = thread_rng();
-    for _pass in 0..passes {
+    for pass_idx in 0..passes {
+        let pass_alpha = if passes == 1 {
+            alpha
+        } else if pass_idx == 0 {
+            1.0
+        } else {
+            alpha
+        };
+
         // Shuffle visit order each pass
         let mut order: Vec<usize> = (0..n).collect();
         order.shuffle(&mut rng);
@@ -613,7 +623,7 @@ where
 
                 // Gather candidates from greedy searches
                 for start in seeds {
-                    let mut part = greedy_search(
+                    let mut part = greedy_search_visited(
                         &vectors[u],
                         vectors,
                         snapshot,
@@ -638,7 +648,7 @@ where
                 });
 
                 // α-prune around u
-                prune_neighbors(u, &candidates, vectors, max_degree, alpha, dist)
+                prune_neighbors(u, &candidates, vectors, max_degree, pass_alpha, dist)
             })
             .collect();
 
@@ -658,7 +668,7 @@ where
                 let ng = &new_graph[pos_of[u]]; // outgoing from this pass
                 let inc = &incoming_flat[incoming_off[u]..incoming_off[u + 1]]; // incoming to u
 
-                // pool = union(outgoing ∪ incoming) with tiny, cache-friendly ops
+                // pool = union(outgoing ∪ incoming)
                 let mut pool_ids: Vec<u32> = Vec::with_capacity(ng.len() + inc.len());
                 pool_ids.extend_from_slice(ng);
                 pool_ids.extend_from_slice(inc);
@@ -672,7 +682,7 @@ where
                     .map(|id| (id, dist.eval(&vectors[u], &vectors[id as usize])))
                     .collect();
 
-                prune_neighbors(u, &pool, vectors, max_degree, alpha, dist)
+                prune_neighbors(u, &pool, vectors, max_degree, pass_alpha, dist)
             })
             .collect();
     }
@@ -696,7 +706,7 @@ where
 
 /// Greedy search used during construction (read-only on `graph`)
 /// Same termination rule as query-time search.
-fn greedy_search<T, D>(
+fn greedy_search_visited<T, D>(
     query: &[T],
     vectors: &[Vec<T>],
     graph: &[Vec<u32>],
@@ -709,8 +719,8 @@ where
     D: Distance<T> + Copy,
 {
     let mut visited = HashSet::new();
-    let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // min-heap by dist
-    let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // max-heap by dist
+    let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+    let mut w: BinaryHeap<Candidate> = BinaryHeap::new();
 
     let start_dist = dist.eval(query, &vectors[start_id]);
     let start = Candidate {
@@ -735,6 +745,7 @@ where
             if !visited.insert(nb) {
                 continue;
             }
+
             let d = dist.eval(query, &vectors[nb as usize]);
             let cand = Candidate { dist: d, id: nb };
 
@@ -749,9 +760,13 @@ where
         }
     }
 
-    let mut v = w.into_vec();
-    v.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
-    v.into_iter().map(|c| (c.id, c.dist)).collect()
+    let mut out: Vec<(u32, f32)> = visited
+        .into_iter()
+        .map(|id| (id, dist.eval(query, &vectors[id as usize])))
+        .collect();
+
+    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    out
 }
 
 /// α-pruning
