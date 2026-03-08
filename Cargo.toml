@@ -35,7 +35,8 @@ anndists = { version = "0.1.4", features = ["stdsimd"] }
 log = { version = "0.4" }
 
 [dev-dependencies]
-hdf5 = {package = "hdf5-metno", version = "0.10.0" }
+# cmake needed for compiling hdf5
+hdf5 = { package = "hdf5-metno", version = "0.10", features = ["static", "zlib"] }
 cpu-time = "1.0.0"
 byteorder = "1.5.0"
 hnsw_rs = {version = "0.3.3", default-features = false, features = ["stdsimd"]}

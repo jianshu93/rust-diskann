@@ -270,7 +270,6 @@ impl OrderedBeam {
 }
 
 /// Reusable scratch buffers for build-time greedy search.
-///
 /// One instance is created per Rayon worker via `map_init`, so allocations are reused
 /// across many nodes in the build.
 #[derive(Debug)]
