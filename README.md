@@ -25,13 +25,16 @@ This implementation follows the DiskANN paper's approach:
         `vectors_offset` is a fixed 1 MiB gap by default.
 
 
-- **Vamana graph construction**: Efficient graph building with α-pruning, with rayon for concurrent and parallel construction
-- **Memory-efficient search**: Uses beam search that visits < 1% of vectors
-- **Generic over any vector<T>**: suport various types of vector input.
-- **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distance metrics
-- **Medoid-based entry points**: Smart starting points for search
-- **Parallel query processing**: Using rayon for concurrent searches. Note: this may increase the loaded pages during memory map
-- **Minimal memory footprint**: ~330MB RAM for 2GB index (16% of file size)
+- **Vamana graph construction**: Builds an approximate nearest-neighbor graph with robust α-pruning and multi-pass refinement. The default build uses at least two passes, with a first diversification pass at α = 1.0 and a second refinement pass at user α (default 1.2).
+- **Parallel batched graph refinement**: Uses rayon to parallelize candidate generation and batched symmetrization/re-pruning during construction for high build throughput.
+- **Build-optimized data layout**:  Uses flat contiguous storage instead of Vec<Vec<T>> during construction to improve cache locality and reduce allocation overhead.
+- **Memory-mapped on-disk index**: Stores vectors and fixed-degree adjacency lists in a single file and memory-maps it for low-overhead loading and search.
+- **Beam-search query algorithm**: Uses a medoid entry point and beam search over the graph, typically visiting only a small fraction of indexed vectors
+- **Generic over vector element type and distance**: Works with generic T and any anndists::Distance<T>, supporting use cases beyond standard floating-point ANN
+- **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distances
+- **Medoid-based entry points**:  Uses an approximate medoid as the default search entry point
+- **Parallel query processing**: Supports concurrent queries with rayon; depending on access patterns, this can increase page activity in the memory-mapped index
+- **Minimal memory footprint**: Keeps RAM usage well below full index size by relying on mmap rather than fully loading the index into memory.
 - **Extensitve benchmarks**: Speed, accuracy and memory consumption benchmark with HNSW (both in-memory and on-disk)
 
 ## Usage in Rust 🦀
