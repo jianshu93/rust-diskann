@@ -246,7 +246,7 @@ total cpu time for search requests 13651226.0 , system time Ok(543.296937ms)
  last distances ratio 1.0001991 
 
  recall rate for "./sift-128-euclidean.hdf5" is 0.994 , nb req /s 18406.172
-
+```
 
 ## License
 MIT 
