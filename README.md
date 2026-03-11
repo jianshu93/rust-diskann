@@ -37,6 +37,15 @@ This implementation follows the DiskANN paper's approach:
 - **Minimal memory footprint**: Keeps RAM usage well below full index size by relying on mmap rather than fully loading the index into memory.
 - **Extensitve benchmarks**: Speed, accuracy and memory consumption benchmark with HNSW (both in-memory and on-disk)
 
+## Visualization of Vamana graph build and search
+The Vamana graph build plot is in 2D with L2 distance. See [diskann-vamana-viz](https://github.com/jianshu93/diskann-vamana-viz) crate.
+![Alt!](https://github.com/jianshu93/rust-diskann/blob/master/vamana_build.jpg?raw=true)
+
+
+For search, the final graph was used. 
+![Alt!](https://github.com/jianshu93/rust-diskann/blob/master/final_graph_query.jpg?raw=true)
+
+
 ## Usage in Rust 🦀
 
 ### Building a New Index
