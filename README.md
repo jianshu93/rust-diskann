@@ -38,13 +38,13 @@ This implementation follows the DiskANN paper's approach:
 - **Extensitve benchmarks**: Speed, accuracy and memory consumption benchmark with HNSW (both in-memory and on-disk)
 
 ## Visualization of Vamana graph build and search
-The Vamana graph build plot is in 2D with L2 distance. See [diskann-vamana-viz](https://github.com/jianshu93/diskann-vamana-viz) crate.
+The Vamana graph build plot is in 2D with L2 distance. See [diskann-vamana-viz](https://github.com/jianshu93/diskann-vamana-viz) crate for details.
 
 <div align="center">
   <img width="80%" src ="vamana_build.jpg">
 </div>
 
-For search, the final graph was used. 
+For search, the final graph was used. The path from entry node (red) to nearest node (green) for the query (pink) in the graph was labeled in orange.
 
 <div align="center">
   <img width="40%" src ="final_graph_query.jpg">
