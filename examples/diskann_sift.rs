@@ -125,8 +125,8 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 64;
     let build_beam_width = 128;
     let alpha = 1.2;
-    let passes = 2usize;      // refinement passes over the graph
-    let extra_seeds = 2usize; // extra random seeds per node per pass
+    let passes = 1usize;      // refinement passes over the graph
+    let extra_seeds = 1usize; // extra random seeds per node per pass
 
     let index_path = "diskann_sift1m.db";
     let index = if !std::path::Path::new(index_path).exists() {
