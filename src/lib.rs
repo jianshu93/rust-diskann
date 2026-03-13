@@ -972,40 +972,48 @@ where
     T: bytemuck::Pod + Copy + Send + Sync,
     D: Distance<T> + Copy,
 {
-    if candidates.is_empty() {
+    if candidates.is_empty() || max_degree == 0 {
         return Vec::new();
     }
 
+    // Sort by distance from node_id, nearest first.
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-    let mut pruned = Vec::<u32>::new();
-
+    // Remove self and duplicate ids while keeping the best (nearest) occurrence.
+    let mut uniq = Vec::<(u32, f32)>::with_capacity(sorted.len());
+    let mut last_id: Option<u32> = None;
     for &(cand_id, cand_dist) in &sorted {
         if cand_id as usize == node_id {
             continue;
         }
-        let mut ok = true;
-        for &sel in &pruned {
-            let d = dist.eval(vectors.row(cand_id as usize), vectors.row(sel as usize));
-            if alpha * d <= cand_dist {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            pruned.push(cand_id);
-            if pruned.len() >= max_degree {
-                break;
-            }
-        }
-    }
-
-    for &(cand_id, _) in &sorted {
-        if cand_id as usize == node_id {
+        if last_id == Some(cand_id) {
             continue;
         }
-        if !pruned.contains(&cand_id) {
+        uniq.push((cand_id, cand_dist));
+        last_id = Some(cand_id);
+    }
+
+    let mut pruned = Vec::<u32>::with_capacity(max_degree);
+
+    // Pure robust pruning: DO NOT backfill rejected candidates.
+    for &(cand_id, cand_dist_to_node) in &uniq {
+        let mut occluded = false;
+
+        for &sel_id in &pruned {
+            let d_cand_sel = dist.eval(
+                vectors.row(cand_id as usize),
+                vectors.row(sel_id as usize),
+            );
+
+            // If selected neighbor sel_id "covers" cand_id, reject cand_id.
+            if alpha * d_cand_sel <= cand_dist_to_node {
+                occluded = true;
+                break;
+            }
+        }
+
+        if !occluded {
             pruned.push(cand_id);
             if pruned.len() >= max_degree {
                 break;
