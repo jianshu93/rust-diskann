@@ -59,6 +59,11 @@ pub const DISKANN_DEFAULT_PASSES: usize = 2;
 /// Default number of extra random seeds per node per pass during graph build
 pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 2;
 
+/// Practical DiskANN-style slack before reverse-neighbor re-pruning.
+/// Legacy C++ DiskANN allows reverse lists to grow to about GRAPH_SLACK_FACTOR * R
+/// before triggering prune, instead of pruning immediately at R.
+const GRAPH_SLACK_FACTOR: f32 = 1.3;
+
 /// Optional bag of knobs if you want to override just a few.
 #[derive(Clone, Copy, Debug)]
 pub struct DiskAnnParams {
@@ -719,6 +724,12 @@ where
     best_idx
 }
 
+/// Build Vamana-like graph using:
+/// - flat contiguous vectors
+/// - per-worker reusable scratch
+/// - dense visited marks
+/// - ordered beams instead of BinaryHeap for build-time greedy search
+/// - batched parallel symmetrization-and-repruning
 fn build_vamana_graph<T, D>(
     vectors: &FlatVectors<T>,
     max_degree: usize,
@@ -736,7 +747,7 @@ where
     let n = vectors.n;
     let mut graph = vec![Vec::<u32>::new(); n];
 
-    // Random bootstrap graph
+    // Random R-out directed graph bootstrap
     {
         let mut rng = thread_rng();
         let target = max_degree.min(n.saturating_sub(1));
@@ -755,7 +766,6 @@ where
 
     let passes = passes.max(1);
     let mut rng = thread_rng();
-    let mut scratch = BuildScratch::new(n, build_beam_width, max_degree, extra_seeds);
 
     for pass_idx in 0..passes {
         let pass_alpha = if passes == 1 {
@@ -769,77 +779,159 @@ where
         let mut order: Vec<usize> = (0..n).collect();
         order.shuffle(&mut rng);
 
+        // Important: practical incremental insertion
         for &u in &order {
-            // Search current graph to get candidate set U
-            let candidate_ids = collect_candidate_ids_from_search(
-                u,
-                vectors,
-                &graph,
-                medoid_id,
-                build_beam_width,
-                extra_seeds,
-                dist,
-                &mut scratch,
-            );
+            let mut scratch = BuildScratch::new(n, build_beam_width, max_degree, extra_seeds);
+            scratch.candidates.clear();
 
-            // RobustPruning(u, U, alpha, R)
-            let pruned_u = prune_neighbor_ids(
+            // Legacy DiskANN-style candidate pool starts from search results,
+            // not whole V. We also include current adjacency as a cheap prior.
+            for &nb in &graph[u] {
+                let d = dist.eval(vectors.row(u), vectors.row(nb as usize));
+                scratch.candidates.push((nb, d));
+            }
+
+            // Seeds: medoid + distinct random starts
+            scratch.seeds.clear();
+            scratch.seeds.push(medoid_id as usize);
+            while scratch.seeds.len() < 1 + extra_seeds {
+                let s = rng.gen_range(0..n);
+                if !scratch.seeds.contains(&s) {
+                    scratch.seeds.push(s);
+                }
+            }
+
+            let seeds = scratch.seeds.clone();
+            for start in seeds {
+                greedy_search_visited_collect(
+                    vectors.row(u),
+                    vectors,
+                    &graph,
+                    start,
+                    build_beam_width,
+                    dist,
+                    &mut scratch,
+                );
+
+                for i in 0..scratch.visited_ids.len() {
+                    scratch
+                        .candidates
+                        .push((scratch.visited_ids[i], scratch.visited_dists[i]));
+                }
+            }
+
+            // Deduplicate by id, keep best distance
+            scratch.candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            scratch.candidates.dedup_by(|a, b| {
+                if a.0 == b.0 {
+                    if a.1 < b.1 {
+                        *b = *a;
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+
+            let pruned = prune_neighbors(
                 u,
-                &candidate_ids,
+                &scratch.candidates,
                 vectors,
                 max_degree,
                 pass_alpha,
                 dist,
             );
-            graph[u] = pruned_u.clone();
 
-            // Insert reverse edges and re-prune overflowed neighbors
-            for &v in &pruned_u {
-                let vv = v as usize;
+            // Set u's outgoing list
+            graph[u] = pruned.clone();
 
-                if vv == u {
-                    continue;
-                }
-
-                if !graph[vv].contains(&(u as u32)) {
-                    graph[vv].push(u as u32);
-                }
-
-                if graph[vv].len() > max_degree {
-                    let current_neighbors = graph[vv].clone();
-                    graph[vv] = prune_neighbor_ids(
-                        vv,
-                        &current_neighbors,
-                        vectors,
-                        max_degree,
-                        pass_alpha,
-                        dist,
-                    );
-                }
-            }
-        }
-    }
-
-    // Final cleanup pass with the final alpha
-    for u in 0..n {
-        if graph[u].len() > max_degree {
-            let current_neighbors = graph[u].clone();
-            graph[u] = prune_neighbor_ids(
-                u,
-                &current_neighbors,
+            // Reverse insertion with slack-triggered overflow re-pruning
+            inter_insert_with_slack(
+                &mut graph,
+                u as u32,
+                &pruned,
                 vectors,
                 max_degree,
-                alpha,
+                pass_alpha,
                 dist,
             );
-        } else {
-            graph[u].sort_unstable();
-            graph[u].dedup();
-            graph[u].retain(|&x| x as usize != u);
         }
     }
 
+    // Final cleanup: exactly the practical thing to keep.
     graph
+        .into_iter()
+        .enumerate()
+        .map(|(u, neigh)| {
+            if neigh.len() <= max_degree {
+                return neigh;
+            }
+            let mut ids = neigh;
+            ids.sort_unstable();
+            ids.dedup();
+
+            let pool: Vec<(u32, f32)> = ids
+                .into_iter()
+                .filter(|&id| id as usize != u)
+                .map(|id| (id, dist.eval(vectors.row(u), vectors.row(id as usize))))
+                .collect();
+
+            prune_neighbors(u, &pool, vectors, max_degree, alpha, dist)
+        })
+        .collect()
+}
+
+
+
+/// Insert reverse edge `src -> dst` in the practical DiskANN style:
+/// - if dst's degree is still below slack * R, just append
+/// - otherwise, gather dst's current neighbors + src, deduplicate, and re-prune dst
+fn inter_insert_with_slack<T, D>(
+    graph: &mut [Vec<u32>],
+    src: u32,
+    pruned_list: &[u32],
+    vectors: &FlatVectors<T>,
+    max_degree: usize,
+    alpha: f32,
+    dist: D,
+) where
+    T: bytemuck::Pod + Copy + Send + Sync,
+    D: Distance<T> + Copy,
+{
+    let slack_limit = ((GRAPH_SLACK_FACTOR * max_degree as f32).ceil() as usize).max(max_degree);
+
+    for &dst in pruned_list {
+        let dst_usize = dst as usize;
+        let src_usize = src as usize;
+
+        if dst_usize == src_usize {
+            continue;
+        }
+
+        // already present -> nothing to do
+        if graph[dst_usize].contains(&src) {
+            continue;
+        }
+
+        if graph[dst_usize].len() < slack_limit {
+            graph[dst_usize].push(src);
+            continue;
+        }
+
+        // overflow: rebuild candidate pool and prune only this destination node
+        let mut ids = graph[dst_usize].clone();
+        ids.push(src);
+        ids.sort_unstable();
+        ids.dedup();
+
+        let pool: Vec<(u32, f32)> = ids
+            .into_iter()
+            .filter(|&id| id as usize != dst_usize)
+            .map(|id| (id, dist.eval(vectors.row(dst_usize), vectors.row(id as usize))))
+            .collect();
+
+        graph[dst_usize] = prune_neighbors(dst_usize, &pool, vectors, max_degree, alpha, dist);
+    }
 }
 
 /// Build-time greedy search:
@@ -908,57 +1000,6 @@ fn greedy_search_visited_collect<T, D>(
     }
 }
 
-fn collect_candidate_ids_from_search<T, D>(
-    node_id: usize,
-    vectors: &FlatVectors<T>,
-    graph: &[Vec<u32>],
-    medoid_id: u32,
-    build_beam_width: usize,
-    extra_seeds: usize,
-    dist: D,
-    scratch: &mut BuildScratch,
-) -> Vec<u32>
-where
-    T: bytemuck::Pod + Copy + Send + Sync,
-    D: Distance<T> + Copy,
-{
-    let n = vectors.n;
-
-    let mut seeds = Vec::<usize>::with_capacity(1 + extra_seeds);
-    seeds.push(medoid_id as usize);
-
-    let mut rng = thread_rng();
-    while seeds.len() < 1 + extra_seeds {
-        let s = rng.gen_range(0..n);
-        if !seeds.contains(&s) {
-            seeds.push(s);
-        }
-    }
-
-    let mut ids = Vec::<u32>::with_capacity(build_beam_width * (1 + extra_seeds));
-
-    for start in seeds {
-        greedy_search_visited_collect(
-            vectors.row(node_id),
-            vectors,
-            graph,
-            start,
-            build_beam_width,
-            dist,
-            scratch,
-        );
-        ids.extend_from_slice(&scratch.visited_ids);
-    }
-
-    ids.push(node_id as u32);
-
-    ids.sort_unstable();
-    ids.dedup();
-    ids.retain(|&x| x as usize != node_id);
-
-    ids
-}
-
 /// α-pruning
 fn prune_neighbors<T, D>(
     node_id: usize,
@@ -1022,44 +1063,6 @@ where
     }
 
     pruned
-}
-
-fn prune_neighbor_ids<T, D>(
-    node_id: usize,
-    candidate_ids: &[u32],
-    vectors: &FlatVectors<T>,
-    max_degree: usize,
-    alpha: f32,
-    dist: D,
-) -> Vec<u32>
-where
-    T: bytemuck::Pod + Copy + Send + Sync,
-    D: Distance<T> + Copy,
-{
-    if candidate_ids.is_empty() || max_degree == 0 {
-        return Vec::new();
-    }
-
-    let mut pool: Vec<(u32, f32)> = candidate_ids
-        .iter()
-        .copied()
-        .filter(|&id| id as usize != node_id)
-        .map(|id| (id, dist.eval(vectors.row(node_id), vectors.row(id as usize))))
-        .collect();
-
-    pool.sort_by(|a, b| a.0.cmp(&b.0));
-    pool.dedup_by(|a, b| {
-        if a.0 == b.0 {
-            if a.1 < b.1 {
-                *b = *a;
-            }
-            true
-        } else {
-            false
-        }
-    });
-
-    prune_neighbors(node_id, &pool, vectors, max_degree, alpha, dist)
 }
 
 #[cfg(test)]
