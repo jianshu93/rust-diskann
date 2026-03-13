@@ -881,8 +881,6 @@ where
         .collect()
 }
 
-
-
 /// Insert reverse edge `src -> dst` in the practical DiskANN style:
 /// - if dst's degree is still below slack * R, just append
 /// - otherwise, gather dst's current neighbors + src, deduplicate, and re-prune dst
