@@ -216,17 +216,17 @@ Train size : 1000000
 Test size  : 10000
 Ground-truth k per query in file: 100
 
-Index file diskann_sift1m.db exists, opening…
-Opened index: 1000000 vectors, dim=128, metric=anndists::dist::distances::DistL2 in 67.314583ms
+Building DiskANN index: n=1000000, dim=128, max_degree=64, build_beam=128, alpha=1.2, passes=1, extra_seeds=1
+Build complete. CPU time: 3906.747201985s, wall time: 3916.977265733s
 
 Searching 10000 queries with k=10, beam_width=512 …
 
  mean fraction nb returned by search 1.0
 
- last distances ratio 1.0000138
+ last distances ratio 1.000009
 
- recall rate for "./sift-128-euclidean.hdf5" is 0.99958 , nb req /s 4026.8235
- total cpu time for search requests 26.905640715s , system time 2.483347659s
+ recall rate for "./sift-128-euclidean.hdf5" is 0.99971 , nb req /s 24379.064
+ total cpu time for search requests 34.90886072s , system time 410.188357ms
 
  
 
@@ -241,11 +241,37 @@ neighbours shape : [10000, 100]
 
  train data shape : [1000000, 128], nbvector 1000000 
  allocating vector for search neighbours answer : 10000
-Found existing index: "./sift1m_l2_hnsw.hnsw.graph" and "./sift1m_l2_hnsw.hnsw.data"
-Reloaded HNSW with 1000000 points
+No saved index. Building new one: N=1000000 layers=16 ef_c=256
+
+  Current scale value : 2.58e-1, Scale modification factor asked : 5.00e-1,(modification factor must be between 2.00e-1 and 1.)
+ 
+ parallel insertion
+ setting number of points 50000 
+ setting number of points 100000 
+ setting number of points 150000 
+ setting number of points 200000 
+ setting number of points 250000 
+ setting number of points 300000 
+ setting number of points 350000 
+ setting number of points 400000 
+ setting number of points 450000 
+ setting number of points 500000 
+ setting number of points 550000 
+ setting number of points 600000 
+ setting number of points 650000 
+ setting number of points 700000 
+ setting number of points 750000 
+ setting number of points 800000 
+ setting number of points 850000 
+ setting number of points 900000 
+ setting number of points 950000 
+ setting number of points 1000000 
+HNSW index saved as: sift1m_l2_hnsw.hnsw.graph / .hnsw.data
+
+ hnsw data insertion cpu time  3014.390977098s  system time Ok(36.777338122s) 
  debug dump of PointIndexation
- layer 0 : length : 999563 
- layer 1 : length : 437 
+ layer 0 : length : 999557 
+ layer 1 : length : 443 
  debug dump of PointIndexation end
  hnsw data nb point inserted 1000000
 searching with ef = 64
@@ -255,13 +281,13 @@ searching with ef = 64
 searching with ef : 64
  
  parallel search
-total cpu time for search requests 13651226.0 , system time Ok(543.296937ms) 
+total cpu time for search requests 14137829.0 , system time Ok(156.329364ms) 
 
  mean fraction nb returned by search 1.0 
 
- last distances ratio 1.0001991 
+ last distances ratio 1.0004259 
 
- recall rate for "./sift-128-euclidean.hdf5" is 0.994 , nb req /s 18406.172
+ recall rate for "./sift-128-euclidean.hdf5" is 0.98743 , nb req /s 63968.066
 ```
 
 ## License
