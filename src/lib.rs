@@ -55,9 +55,9 @@ pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
 pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
 /// Default number of refinement passes during graph build
-pub const DISKANN_DEFAULT_PASSES: usize = 2;
+pub const DISKANN_DEFAULT_PASSES: usize = 1;
 /// Default number of extra random seeds per node per pass during graph build
-pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 2;
+pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 1;
 
 /// Practical DiskANN-style slack before reverse-neighbor re-pruning.
 /// Legacy C++ DiskANN allows reverse lists to grow to about GRAPH_SLACK_FACTOR * R
@@ -724,12 +724,7 @@ where
     best_idx
 }
 
-/// Build Vamana-like graph using:
-/// - flat contiguous vectors
-/// - per-worker reusable scratch
-/// - dense visited marks
-/// - ordered beams instead of BinaryHeap for build-time greedy search
-/// - batched parallel symmetrization-and-repruning
+/// Build Vamana-like graph
 fn build_vamana_graph<T, D>(
     vectors: &FlatVectors<T>,
     max_degree: usize,
