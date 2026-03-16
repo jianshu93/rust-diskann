@@ -823,9 +823,9 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
     // build CSR offsets only for affected nodes.
     merge.affected_nodes.sort_unstable();
 
-    merge.incoming_offsets[0] = 0;
     let mut running = 0usize;
     for &u in &merge.affected_nodes {
+        merge.incoming_offsets[u] = running;
         running += merge.incoming_counts[u];
         merge.incoming_offsets[u + 1] = running;
     }
@@ -876,7 +876,7 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
             }
 
             // Remove self-loops.
-            ids.retain(|&id| id as usize != u);
+            ids.retain(|&id| id != PAD_U32 && id as usize != u);
 
             // Deduplicate ids before scoring.
             ids.sort_unstable();
