@@ -64,6 +64,24 @@ pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 1;
 /// before triggering prune, instead of pruning immediately at R.
 const GRAPH_SLACK_FACTOR: f32 = 1.3;
 
+
+/// Number of nodes processed together in one micro-batch during graph build.
+///
+/// Smaller values:
+/// - are closer to true incremental insertion
+/// - usually improve faithfulness to practical Vamana behavior
+/// - but are slower
+///
+/// Larger values:
+/// - are faster
+/// - but behave more like a batched graph rebuild
+/// Recommended starting values:
+/// - 128 for better quality
+/// - 256 for a balanced tradeoff
+/// - 512 for faster builds
+
+const MICRO_BATCH_CHUNK_SIZE: usize = 256;
+
 /// Optional bag of knobs if you want to override just a few.
 #[derive(Clone, Copy, Debug)]
 pub struct DiskAnnParams {
@@ -337,6 +355,19 @@ impl BuildScratch {
         self.marks[idx] = self.epoch;
         self.visited_ids.push(idx as u32);
         self.visited_dists.push(dist);
+    }
+}
+
+#[derive(Debug)]
+struct IncrementalInsertScratch {
+    build: BuildScratch,
+}
+
+impl IncrementalInsertScratch {
+    fn new(n: usize, beam_width: usize, max_degree: usize, extra_seeds: usize) -> Self {
+        Self {
+            build: BuildScratch::new(n, beam_width, max_degree, extra_seeds),
+        }
     }
 }
 
@@ -724,7 +755,221 @@ where
     best_idx
 }
 
-/// Build Vamana-like graph
+fn dedup_keep_best_by_id_in_place(cands: &mut Vec<(u32, f32)>) {
+    if cands.is_empty() {
+        return;
+    }
+
+    cands.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.total_cmp(&b.1))
+    });
+
+    let mut write = 0usize;
+    for read in 0..cands.len() {
+        if write == 0 || cands[read].0 != cands[write - 1].0 {
+            cands[write] = cands[read];
+            write += 1;
+        }
+    }
+    cands.truncate(write);
+}
+
+/// Merge one micro-batch of newly computed outgoing neighbor lists back into the graph.
+/// 1. Mark all nodes in the chunk as affected.
+/// 2. Count reverse-edge insertions implied by the chunk.
+/// 3. Build a CSR-style flat incoming buffer.
+/// 4. Commit chunk outgoing lists.
+/// 5. Re-prune only the affected nodes.
+///
+/// This keeps the practical micro-batched DiskANN behavior while significantly
+/// reducing allocator pressure on large builds.
+fn merge_chunk_updates_into_graph_reuse<T, D>(
+    graph: &mut [Vec<u32>],
+    chunk_nodes: &[usize],
+    chunk_pruned: &[Vec<u32>],
+    vectors: &FlatVectors<T>,
+    max_degree: usize,
+    _slack_limit: usize,
+    alpha: f32,
+    dist: D,
+    merge: &mut MergeScratch,
+) where
+    T: bytemuck::Pod + Copy + Send + Sync,
+    D: Distance<T> + Copy + Sync,
+{
+    merge.reset();
+    // mark chunk nodes as affected.
+    for &u in chunk_nodes {
+        merge.mark_affected(u);
+    }
+
+    // count reverse-edge insertions, and mark touched destinations.
+    let mut total_incoming = 0usize;
+
+    for (local_idx, &u) in chunk_nodes.iter().enumerate() {
+        for &dst in &chunk_pruned[local_idx] {
+            let dst_usize = dst as usize;
+            if dst_usize == u {
+                continue;
+            }
+
+            merge.mark_affected(dst_usize);
+            merge.incoming_counts[dst_usize] += 1;
+            total_incoming += 1;
+        }
+    }
+
+    // build CSR offsets only for affected nodes.
+    merge.affected_nodes.sort_unstable();
+
+    merge.incoming_offsets[0] = 0;
+    let mut running = 0usize;
+    for &u in &merge.affected_nodes {
+        running += merge.incoming_counts[u];
+        merge.incoming_offsets[u + 1] = running;
+    }
+
+    merge.incoming_flat.resize(total_incoming, PAD_U32);
+
+    // For affected nodes only, initialize write cursors.
+    for &u in &merge.affected_nodes {
+        merge.incoming_write[u] = merge.incoming_offsets[u];
+    }
+
+    // fill CSR incoming buffer.
+    // incoming_flat[offset[u]..offset[u+1]] stores reverse insertions targeting u.
+    for (local_idx, &u) in chunk_nodes.iter().enumerate() {
+        for &dst in &chunk_pruned[local_idx] {
+            let dst_usize = dst as usize;
+            if dst_usize == u {
+                continue;
+            }
+
+            let pos = merge.incoming_write[dst_usize];
+            merge.incoming_flat[pos] = u as u32;
+            merge.incoming_write[dst_usize] += 1;
+        }
+    }
+
+    // commit the chunk's outgoing lists first.
+    for (local_idx, &u) in chunk_nodes.iter().enumerate() {
+        graph[u] = chunk_pruned[local_idx].clone();
+    }
+    // re-prune only affected nodes.
+    let affected = merge.affected_nodes.clone();
+
+    let updated_pairs: Vec<(usize, Vec<u32>)> = affected
+        .into_par_iter()
+        .map(|u| {
+            let start = merge.incoming_offsets[u];
+            let end = merge.incoming_offsets[u + 1];
+
+            let mut ids: Vec<u32> = Vec::with_capacity(graph[u].len() + (end - start));
+
+            // Current adjacency after chunk commit.
+            ids.extend_from_slice(&graph[u]);
+
+            // Reverse insertions from this chunk.
+            if start < end {
+                ids.extend_from_slice(&merge.incoming_flat[start..end]);
+            }
+
+            // Remove self-loops.
+            ids.retain(|&id| id as usize != u);
+
+            // Deduplicate ids before scoring.
+            ids.sort_unstable();
+            ids.dedup();
+
+            if ids.is_empty() {
+                return (u, Vec::new());
+            }
+
+            let mut pool = Vec::<(u32, f32)>::with_capacity(ids.len());
+            for id in ids {
+                let d = dist.eval(vectors.row(u), vectors.row(id as usize));
+                pool.push((id, d));
+            }
+
+            let pruned = prune_neighbors(u, &pool, vectors, max_degree, alpha, dist);
+            (u, pruned)
+        })
+        .collect();
+
+    for (u, neigh) in updated_pairs {
+        graph[u] = neigh;
+    }
+    // Optional cleanup for next chunk: clear only touched counts/offset tails.
+    for &u in &merge.affected_nodes {
+        merge.incoming_counts[u] = 0;
+        merge.incoming_offsets[u + 1] = 0;
+    }
+}
+
+/// Reusable scratch buffers for micro-batch merge.
+///
+/// This avoids rebuilding `Vec<Vec<u32>>` for incoming reverse edges on every chunk.
+/// Instead, incoming reverse edges are accumulated into a CSR-like flat buffer.
+///
+/// Layout:
+/// - incoming_counts[u] = number of reverse edges targeting node u in this chunk
+/// - incoming_offsets[u]..incoming_offsets[u+1] is u's segment in incoming_flat
+/// - affected_nodes stores exactly the nodes touched in this chunk, so we do not
+///   scan all `n` nodes during merge.
+#[derive(Debug)]
+struct MergeScratch {
+    incoming_counts: Vec<usize>,
+    incoming_offsets: Vec<usize>,
+    incoming_write: Vec<usize>,
+    incoming_flat: Vec<u32>,
+
+    affected_marks: Vec<u32>,
+    affected_epoch: u32,
+    affected_nodes: Vec<usize>,
+}
+
+impl MergeScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            incoming_counts: vec![0usize; n],
+            incoming_offsets: vec![0usize; n + 1],
+            incoming_write: vec![0usize; n],
+            incoming_flat: Vec::new(),
+            affected_marks: vec![0u32; n],
+            affected_epoch: 1,
+            affected_nodes: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.affected_epoch = self.affected_epoch.wrapping_add(1);
+        if self.affected_epoch == 0 {
+            self.affected_marks.fill(0);
+            self.affected_epoch = 1;
+        }
+        self.affected_nodes.clear();
+        self.incoming_flat.clear();
+    }
+
+    #[inline]
+    fn mark_affected(&mut self, u: usize) {
+        if self.affected_marks[u] != self.affected_epoch {
+            self.affected_marks[u] = self.affected_epoch;
+            self.affected_nodes.push(u);
+            self.incoming_counts[u] = 0;
+        }
+    }
+}
+
+/// Build a Vamana-like graph using a micro-batched practical DiskANN strategy,
+/// with reusable scratch both for per-thread search state and for chunk merge state.
+///
+/// Compared with the simpler micro-batched implementation, this version avoids:
+/// - allocating `Vec<Vec<u32>>` for incoming reverse edges every chunk
+/// - scanning all nodes to discover affected merge targets
+
 fn build_vamana_graph<T, D>(
     vectors: &FlatVectors<T>,
     max_degree: usize,
@@ -741,8 +986,7 @@ where
 {
     let n = vectors.n;
     let mut graph = vec![Vec::<u32>::new(); n];
-
-    // Random R-out directed graph bootstrap
+    // Bootstrap with a random R-out directed graph.
     {
         let mut rng = thread_rng();
         let target = max_degree.min(n.saturating_sub(1));
@@ -761,6 +1005,10 @@ where
 
     let passes = passes.max(1);
     let mut rng = thread_rng();
+    let slack_limit = ((GRAPH_SLACK_FACTOR * max_degree as f32).ceil() as usize).max(max_degree);
+
+    // Reused across all chunks in all passes.
+    let mut merge_scratch = MergeScratch::new(n);
 
     for pass_idx in 0..passes {
         let pass_alpha = if passes == 1 {
@@ -774,93 +1022,101 @@ where
         let mut order: Vec<usize> = (0..n).collect();
         order.shuffle(&mut rng);
 
-        // Important: practical incremental insertion
-        for &u in &order {
-            let mut scratch = BuildScratch::new(n, build_beam_width, max_degree, extra_seeds);
-            scratch.candidates.clear();
+        for chunk in order.chunks(MICRO_BATCH_CHUNK_SIZE) {
+            let snapshot = &graph;
+            // Compute new outgoing lists for this chunk in parallel.
+            let chunk_results: Vec<(usize, Vec<u32>)> = chunk
+                .par_iter()
+                .map_init(
+                    || IncrementalInsertScratch::new(n, build_beam_width, max_degree, extra_seeds),
+                    |scratch, &u| {
+                        let bs = &mut scratch.build;
+                        bs.candidates.clear();
 
-            // Legacy DiskANN-style candidate pool starts from search results,
-            // not whole V. We also include current adjacency as a cheap prior.
-            for &nb in &graph[u] {
-                let d = dist.eval(vectors.row(u), vectors.row(nb as usize));
-                scratch.candidates.push((nb, d));
+                        // Start from current adjacency.
+                        for &nb in &snapshot[u] {
+                            let d = dist.eval(vectors.row(u), vectors.row(nb as usize));
+                            bs.candidates.push((nb, d));
+                        }
+
+                        // Seed list: medoid + distinct random starts.
+                        bs.seeds.clear();
+                        bs.seeds.push(medoid_id as usize);
+
+                        let mut local_rng = thread_rng();
+                        while bs.seeds.len() < 1 + extra_seeds {
+                            let s = local_rng.gen_range(0..n);
+                            if !bs.seeds.contains(&s) {
+                                bs.seeds.push(s);
+                            }
+                        }
+
+                        let seeds_len = bs.seeds.len();
+                        for si in 0..seeds_len {
+                            let start = bs.seeds[si];
+
+                            greedy_search_visited_collect(
+                                vectors.row(u),
+                                vectors,
+                                snapshot,
+                                start,
+                                build_beam_width,
+                                dist,
+                                bs,
+                            );
+
+                            for i in 0..bs.visited_ids.len() {
+                                bs.candidates.push((bs.visited_ids[i], bs.visited_dists[i]));
+                            }
+                        }
+
+                        dedup_keep_best_by_id_in_place(&mut bs.candidates);
+
+                        let pruned = prune_neighbors(
+                            u,
+                            &bs.candidates,
+                            vectors,
+                            max_degree,
+                            pass_alpha,
+                            dist,
+                        );
+
+                        (u, pruned)
+                    },
+                )
+                .collect();
+
+            let mut chunk_nodes = Vec::<usize>::with_capacity(chunk_results.len());
+            let mut chunk_pruned = Vec::<Vec<u32>>::with_capacity(chunk_results.len());
+
+            for (u, pruned) in chunk_results {
+                chunk_nodes.push(u);
+                chunk_pruned.push(pruned);
             }
-
-            // Seeds: medoid + distinct random starts
-            scratch.seeds.clear();
-            scratch.seeds.push(medoid_id as usize);
-            while scratch.seeds.len() < 1 + extra_seeds {
-                let s = rng.gen_range(0..n);
-                if !scratch.seeds.contains(&s) {
-                    scratch.seeds.push(s);
-                }
-            }
-
-            let seeds = scratch.seeds.clone();
-            for start in seeds {
-                greedy_search_visited_collect(
-                    vectors.row(u),
-                    vectors,
-                    &graph,
-                    start,
-                    build_beam_width,
-                    dist,
-                    &mut scratch,
-                );
-
-                for i in 0..scratch.visited_ids.len() {
-                    scratch
-                        .candidates
-                        .push((scratch.visited_ids[i], scratch.visited_dists[i]));
-                }
-            }
-
-            // Deduplicate by id, keep best distance
-            scratch.candidates.sort_by(|a, b| a.0.cmp(&b.0));
-            scratch.candidates.dedup_by(|a, b| {
-                if a.0 == b.0 {
-                    if a.1 < b.1 {
-                        *b = *a;
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
-
-            let pruned = prune_neighbors(
-                u,
-                &scratch.candidates,
-                vectors,
-                max_degree,
-                pass_alpha,
-                dist,
-            );
-
-            // Set u's outgoing list
-            graph[u] = pruned.clone();
-
-            // Reverse insertion with slack-triggered overflow re-pruning
-            inter_insert_with_slack(
+            // Merge chunk back into graph using reusable CSR-style scratch.
+            merge_chunk_updates_into_graph_reuse(
                 &mut graph,
-                u as u32,
-                &pruned,
+                &chunk_nodes,
+                &chunk_pruned,
                 vectors,
                 max_degree,
+                slack_limit,
                 pass_alpha,
                 dist,
+                &mut merge_scratch,
             );
         }
     }
 
-    // Final cleanup: exactly the practical thing to keep.
+    // Final cleanup: enforce bounded degree and deduplication.
     graph
-        .into_iter()
+        .into_par_iter()
         .enumerate()
         .map(|(u, neigh)| {
             if neigh.len() <= max_degree {
                 return neigh;
             }
+
             let mut ids = neigh;
             ids.sort_unstable();
             ids.dedup();
@@ -874,57 +1130,6 @@ where
             prune_neighbors(u, &pool, vectors, max_degree, alpha, dist)
         })
         .collect()
-}
-
-/// Insert reverse edge `src -> dst` in the practical DiskANN style:
-/// - if dst's degree is still below slack * R, just append
-/// - otherwise, gather dst's current neighbors + src, deduplicate, and re-prune dst
-fn inter_insert_with_slack<T, D>(
-    graph: &mut [Vec<u32>],
-    src: u32,
-    pruned_list: &[u32],
-    vectors: &FlatVectors<T>,
-    max_degree: usize,
-    alpha: f32,
-    dist: D,
-) where
-    T: bytemuck::Pod + Copy + Send + Sync,
-    D: Distance<T> + Copy,
-{
-    let slack_limit = ((GRAPH_SLACK_FACTOR * max_degree as f32).ceil() as usize).max(max_degree);
-
-    for &dst in pruned_list {
-        let dst_usize = dst as usize;
-        let src_usize = src as usize;
-
-        if dst_usize == src_usize {
-            continue;
-        }
-
-        // already present -> nothing to do
-        if graph[dst_usize].contains(&src) {
-            continue;
-        }
-
-        if graph[dst_usize].len() < slack_limit {
-            graph[dst_usize].push(src);
-            continue;
-        }
-
-        // overflow: rebuild candidate pool and prune only this destination node
-        let mut ids = graph[dst_usize].clone();
-        ids.push(src);
-        ids.sort_unstable();
-        ids.dedup();
-
-        let pool: Vec<(u32, f32)> = ids
-            .into_iter()
-            .filter(|&id| id as usize != dst_usize)
-            .map(|id| (id, dist.eval(vectors.row(dst_usize), vectors.row(id as usize))))
-            .collect();
-
-        graph[dst_usize] = prune_neighbors(dst_usize, &pool, vectors, max_degree, alpha, dist);
-    }
 }
 
 /// Build-time greedy search:
