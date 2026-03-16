@@ -776,11 +776,11 @@ fn dedup_keep_best_by_id_in_place(cands: &mut Vec<(u32, f32)>) {
 }
 
 /// Merge one micro-batch of newly computed outgoing neighbor lists back into the graph.
-/// 1. Mark all nodes in the chunk as affected.
-/// 2. Count reverse-edge insertions implied by the chunk.
-/// 3. Build a CSR-style flat incoming buffer.
-/// 4. Commit chunk outgoing lists.
-/// 5. Re-prune only the affected nodes.
+/// Mark all nodes in the chunk as affected.
+/// Count reverse-edge insertions implied by the chunk.
+/// Build a CSR-style flat incoming buffer.
+/// Commit chunk outgoing lists.
+/// Re-prune only the affected nodes.
 ///
 /// This keeps the practical micro-batched DiskANN behavior while significantly
 /// reducing allocator pressure on large builds.
@@ -908,7 +908,6 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
 }
 
 /// Reusable scratch buffers for micro-batch merge.
-///
 /// This avoids rebuilding `Vec<Vec<u32>>` for incoming reverse edges on every chunk.
 /// Instead, incoming reverse edges are accumulated into a CSR-like flat buffer.
 ///
@@ -965,11 +964,6 @@ impl MergeScratch {
 
 /// Build a Vamana-like graph using a micro-batched practical DiskANN strategy,
 /// with reusable scratch both for per-thread search state and for chunk merge state.
-///
-/// Compared with the simpler micro-batched implementation, this version avoids:
-/// - allocating `Vec<Vec<u32>>` for incoming reverse edges every chunk
-/// - scanning all nodes to discover affected merge targets
-
 fn build_vamana_graph<T, D>(
     vectors: &FlatVectors<T>,
     max_degree: usize,
@@ -1136,7 +1130,6 @@ where
 /// - dense visited marks instead of HashMap/HashSet
 /// - visited_ids + visited_dists instead of recomputing distances later
 /// - ordered beams instead of BinaryHeap
-///
 /// Output is written into `scratch.visited_ids` and `scratch.visited_dists`.
 fn greedy_search_visited_collect<T, D>(
     query: &[T],
