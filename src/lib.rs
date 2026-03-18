@@ -781,16 +781,13 @@ fn dedup_keep_best_by_id_in_place(cands: &mut Vec<(u32, f32)>) {
 /// Build a CSR-style flat incoming buffer.
 /// Commit chunk outgoing lists.
 /// Re-prune only the affected nodes.
-///
-/// This keeps the practical micro-batched DiskANN behavior while significantly
-/// reducing allocator pressure on large builds.
 fn merge_chunk_updates_into_graph_reuse<T, D>(
     graph: &mut [Vec<u32>],
     chunk_nodes: &[usize],
     chunk_pruned: &[Vec<u32>],
     vectors: &FlatVectors<T>,
     max_degree: usize,
-    _slack_limit: usize,
+    slack_limit: usize,
     alpha: f32,
     dist: D,
     merge: &mut MergeScratch,
@@ -799,12 +796,13 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
     D: Distance<T> + Copy + Sync,
 {
     merge.reset();
-    // mark chunk nodes as affected.
+
+    // Mark chunk nodes as affected.
     for &u in chunk_nodes {
         merge.mark_affected(u);
     }
 
-    // count reverse-edge insertions, and mark touched destinations.
+    // Count reverse-edge insertions and mark touched destinations.
     let mut total_incoming = 0usize;
 
     for (local_idx, &u) in chunk_nodes.iter().enumerate() {
@@ -820,7 +818,7 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
         }
     }
 
-    // build CSR offsets only for affected nodes.
+    // Build CSR offsets only for affected nodes.
     merge.affected_nodes.sort_unstable();
 
     let mut running = 0usize;
@@ -832,13 +830,12 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
 
     merge.incoming_flat.resize(total_incoming, PAD_U32);
 
-    // For affected nodes only, initialize write cursors.
+    // Initialize write cursors.
     for &u in &merge.affected_nodes {
         merge.incoming_write[u] = merge.incoming_offsets[u];
     }
 
-    // fill CSR incoming buffer.
-    // incoming_flat[offset[u]..offset[u+1]] stores reverse insertions targeting u.
+    // Fill CSR incoming buffer.
     for (local_idx, &u) in chunk_nodes.iter().enumerate() {
         for &dst in &chunk_pruned[local_idx] {
             let dst_usize = dst as usize;
@@ -852,11 +849,13 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
         }
     }
 
-    // commit the chunk's outgoing lists first.
+    // Commit chunk outgoing lists first.
     for (local_idx, &u) in chunk_nodes.iter().enumerate() {
         graph[u] = chunk_pruned[local_idx].clone();
     }
-    // re-prune only affected nodes.
+
+    // Hybrid slack-aware microbatch merge:
+    // keep merged lists under slack, reprune only overflowed ones.
     let affected = merge.affected_nodes.clone();
 
     let updated_pairs: Vec<(usize, Vec<u32>)> = affected
@@ -875,10 +874,10 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
                 ids.extend_from_slice(&merge.incoming_flat[start..end]);
             }
 
-            // Remove self-loops.
+            // Remove self-loops / padding.
             ids.retain(|&id| id != PAD_U32 && id as usize != u);
 
-            // Deduplicate ids before scoring.
+            // Deduplicate.
             ids.sort_unstable();
             ids.dedup();
 
@@ -886,6 +885,12 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
                 return (u, Vec::new());
             }
 
+            // Under slack: keep as-is.
+            if ids.len() <= slack_limit {
+                return (u, ids);
+            }
+
+            // Overflow: score and prune back to max_degree.
             let mut pool = Vec::<(u32, f32)>::with_capacity(ids.len());
             for id in ids {
                 let d = dist.eval(vectors.row(u), vectors.row(id as usize));
@@ -900,7 +905,8 @@ fn merge_chunk_updates_into_graph_reuse<T, D>(
     for (u, neigh) in updated_pairs {
         graph[u] = neigh;
     }
-    // Optional cleanup for next chunk: clear only touched counts/offset tails.
+
+    // Cleanup touched metadata.
     for &u in &merge.affected_nodes {
         merge.incoming_counts[u] = 0;
         merge.incoming_offsets[u + 1] = 0;
@@ -1191,7 +1197,7 @@ fn greedy_search_visited_collect<T, D>(
     }
 }
 
-/// α-pruning
+/// α-pruning with nearest-neighbor backfill.
 fn prune_neighbors<T, D>(
     node_id: usize,
     candidates: &[(u32, f32)],
@@ -1212,7 +1218,7 @@ where
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-    // Remove self and duplicate ids while keeping the best (nearest) occurrence.
+    // Remove self and duplicate ids while keeping the nearest occurrence.
     let mut uniq = Vec::<(u32, f32)>::with_capacity(sorted.len());
     let mut last_id: Option<u32> = None;
     for &(cand_id, cand_dist) in &sorted {
@@ -1226,9 +1232,13 @@ where
         last_id = Some(cand_id);
     }
 
+    if uniq.is_empty() {
+        return Vec::new();
+    }
+
     let mut pruned = Vec::<u32>::with_capacity(max_degree);
 
-    // Pure robust pruning: DO NOT backfill rejected candidates.
+    // Phase 1: robust α-pruning
     for &(cand_id, cand_dist_to_node) in &uniq {
         let mut occluded = false;
 
@@ -1238,7 +1248,6 @@ where
                 vectors.row(sel_id as usize),
             );
 
-            // If selected neighbor sel_id "covers" cand_id, reject cand_id.
             if alpha * d_cand_sel <= cand_dist_to_node {
                 occluded = true;
                 break;
@@ -1246,6 +1255,19 @@ where
         }
 
         if !occluded {
+            pruned.push(cand_id);
+            if pruned.len() >= max_degree {
+                return pruned;
+            }
+        }
+    }
+
+    // Phase 2: backfill nearest remaining candidates
+    if pruned.len() < max_degree {
+        for &(cand_id, _) in &uniq {
+            if pruned.contains(&cand_id) {
+                continue;
+            }
             pruned.push(cand_id);
             if pruned.len() >= max_degree {
                 break;
