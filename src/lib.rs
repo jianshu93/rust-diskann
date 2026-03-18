@@ -129,7 +129,6 @@ struct Metadata {
     num_vectors: usize,
     max_degree: usize,
     medoid_id: u32,
-    entry_points: Vec<u32>,
     vectors_offset: u64,
     adjacency_offset: u64,
     elem_size: u8,
@@ -387,11 +386,8 @@ where
     /// Informational: type name of the distance (from metadata)
     pub distance_name: String,
 
-    /// Global medoid
+    /// ID of the medoid (used as entry point)
     medoid_id: u32,
-
-    /// Additional build-time entry points for multi-entry search
-    entry_points: Vec<u32>,
     // Offsets
     vectors_offset: u64,
     adjacency_offset: u64,
@@ -485,19 +481,12 @@ where
             );
         }
 
-        let mut entry_points = metadata.entry_points;
-        if entry_points.is_empty() {
-            // backward compatibility with older indexes
-            entry_points.push(metadata.medoid_id);
-        }
-
         Ok(Self {
             dim: metadata.dim,
             num_vectors: metadata.num_vectors,
             max_degree: metadata.max_degree,
             distance_name: metadata.distance_name,
             medoid_id: metadata.medoid_id,
-            entry_points,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
             mmap,
@@ -580,12 +569,8 @@ where
         file.seek(SeekFrom::Start(vectors_offset as u64))?;
         file.write_all(bytemuck::cast_slice::<T, u8>(&flat.data))?;
 
-        // Compute primary medoid
-        let medoid_id = calculate_medoid(&flat, dist) as u32;
-
-        // Compute multi-entry seeds
-        // 8 is just a starting choice; tune later if needed.
-        let entry_points = select_entry_points(&flat, dist, medoid_id as usize, 8, 4096);
+        // Compute medoid using flat storage
+        let medoid_id = calculate_medoid(&flat, dist);
 
         // Build graph
         let adjacency_offset = vectors_offset as u64 + total_vector_bytes;
@@ -597,7 +582,7 @@ where
             passes,
             extra_seeds,
             dist,
-            medoid_id,
+            medoid_id as u32,
         );
 
         // Write adjacency lists
@@ -614,8 +599,7 @@ where
             dim,
             num_vectors,
             max_degree,
-            medoid_id,
-            entry_points: entry_points.clone(),
+            medoid_id: medoid_id as u32,
             vectors_offset: vectors_offset as u64,
             adjacency_offset,
             elem_size: std::mem::size_of::<T>() as u8,
@@ -638,7 +622,6 @@ where
             max_degree,
             distance_name: metadata.distance_name,
             medoid_id: metadata.medoid_id,
-            entry_points,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
             mmap,
@@ -647,13 +630,9 @@ where
         })
     }
 
-    pub fn search_with_dists_multi(
-        &self,
-        query: &[T],
-        k: usize,
-        beam_width: usize,
-        num_entries: usize,
-    ) -> Vec<(u32, f32)> {
+    /// Searches the index for nearest neighbors using a best-first beam search.
+    /// Termination rule: continue while the best frontier can still improve the worst in working set.
+    pub fn search_with_dists(&self, query: &[T], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
         assert_eq!(
             query.len(),
             self.dim,
@@ -662,59 +641,18 @@ where
             self.dim
         );
 
-        if k == 0 || beam_width == 0 || self.num_vectors == 0 {
-            return Vec::new();
-        }
-
         let mut visited = HashSet::new();
         let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
         let mut w: BinaryHeap<Candidate> = BinaryHeap::new();
 
-        // Choose which entry nodes to seed from.
-        // Strategy:
-        // 1. If no extra entry_ids were stored, fall back to medoid only.
-        // 2. Otherwise score all stored entry_ids against the query.
-        // 3. Keep the best `num_entries` of them as actual search seeds.
-        let chosen_entries: Vec<Candidate> = if self.entry_points.is_empty() {
-            vec![Candidate {
-                dist: self.distance_to(query, self.medoid_id as usize),
-                id: self.medoid_id,
-            }]
-        } else {
-            let effective_num_entries = num_entries.max(1).min(self.entry_points.len());
-
-            let mut entry_cands: Vec<Candidate> = self
-                .entry_points
-                .iter()
-                .copied()
-                .map(|id| Candidate {
-                    dist: self.distance_to(query, id as usize),
-                    id,
-                })
-                .collect();
-
-            entry_cands.sort_by(|a, b| a.dist.total_cmp(&b.dist));
-            entry_cands.truncate(effective_num_entries);
-            entry_cands
+        let start_dist = self.distance_to(query, self.medoid_id as usize);
+        let start = Candidate {
+            dist: start_dist,
+            id: self.medoid_id,
         };
-
-        // Seed frontier + working set from selected entries.
-        for cand in chosen_entries {
-            if !visited.insert(cand.id) {
-                continue;
-            }
-
-            frontier.push(Reverse(cand));
-
-            if w.len() < beam_width {
-                w.push(cand);
-            } else if let Some(worst) = w.peek() {
-                if cand.dist < worst.dist {
-                    w.pop();
-                    w.push(cand);
-                }
-            }
-        }
+        frontier.push(Reverse(start));
+        w.push(start);
+        visited.insert(self.medoid_id);
 
         while let Some(Reverse(best)) = frontier.peek().copied() {
             if w.len() >= beam_width {
@@ -724,7 +662,6 @@ where
                     }
                 }
             }
-
             let Reverse(current) = frontier.pop().unwrap();
 
             for &nb in self.get_neighbors(current.id) {
@@ -741,12 +678,10 @@ where
                 if w.len() < beam_width {
                     w.push(cand);
                     frontier.push(Reverse(cand));
-                } else if let Some(worst) = w.peek() {
-                    if d < worst.dist {
-                        w.pop();
-                        w.push(cand);
-                        frontier.push(Reverse(cand));
-                    }
+                } else if d < w.peek().unwrap().dist {
+                    w.pop();
+                    w.push(cand);
+                    frontier.push(Reverse(cand));
                 }
             }
         }
@@ -755,15 +690,6 @@ where
         results.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         results.truncate(k);
         results.into_iter().map(|c| (c.id, c.dist)).collect()
-    }
-
-    pub fn search_with_dists(&self, query: &[T], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
-        let default_num_entries = if self.entry_points.is_empty() {
-            1
-        } else {
-            self.entry_points.len()
-        };
-        self.search_with_dists_multi(query, k, beam_width, default_num_entries)
     }
 
     /// search but only return neighbor ids
@@ -827,88 +753,6 @@ where
         .reduce(|| (0usize, f32::MAX), |a, b| if a.1 <= b.1 { a } else { b });
 
     best_idx
-}
-
-fn select_entry_points<T, D>(
-    vectors: &FlatVectors<T>,
-    dist: D,
-    medoid_id: usize,
-    num_entry_points: usize,
-    sample_size: usize,
-) -> Vec<u32>
-where
-    T: bytemuck::Pod + Copy + Send + Sync,
-    D: Distance<T> + Copy + Sync,
-{
-    let n = vectors.n;
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let target = num_entry_points.max(1).min(n);
-    let sample_cap = sample_size.max(target).min(n);
-
-    let mut rng = thread_rng();
-
-    // Random sample of dataset indices
-    let mut sample: Vec<usize> = (0..n).collect();
-    sample.shuffle(&mut rng);
-    sample.truncate(sample_cap);
-
-    // Ensure medoid is in sample
-    if !sample.contains(&medoid_id) {
-        if !sample.is_empty() {
-            sample[0] = medoid_id;
-        } else {
-            sample.push(medoid_id);
-        }
-    }
-
-    let mut entries: Vec<usize> = Vec::with_capacity(target);
-    entries.push(medoid_id);
-
-    let mut chosen = vec![false; sample.len()];
-    for (i, &sid) in sample.iter().enumerate() {
-        if sid == medoid_id {
-            chosen[i] = true;
-            break;
-        }
-    }
-
-    while entries.len() < target {
-        let mut best_sample_pos: Option<usize> = None;
-        let mut best_score = -1.0f32;
-
-        for (pos, &cand) in sample.iter().enumerate() {
-            if chosen[pos] {
-                continue;
-            }
-
-            // farthest-point criterion: maximize distance to nearest chosen entry
-            let mut min_d = f32::MAX;
-            for &e in &entries {
-                let d = dist.eval(vectors.row(cand), vectors.row(e));
-                if d < min_d {
-                    min_d = d;
-                }
-            }
-
-            if min_d > best_score {
-                best_score = min_d;
-                best_sample_pos = Some(pos);
-            }
-        }
-
-        match best_sample_pos {
-            Some(pos) => {
-                chosen[pos] = true;
-                entries.push(sample[pos]);
-            }
-            None => break,
-        }
-    }
-
-    entries.into_iter().map(|x| x as u32).collect()
 }
 
 fn dedup_keep_best_by_id_in_place(cands: &mut Vec<(u32, f32)>) {
