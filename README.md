@@ -1,4 +1,4 @@
-# Dynamic DiskANN: Memory-Mapped ANN Search with In-Place Insert and Delete 🦀
+# Rust-DiskANN: Dynamic on-disk graph-based approximate nearest neighbor search with In-Place Insert and Delete 🦀
 
 [![Latest Version](https://img.shields.io/crates/v/rust_diskann?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/rust_diskann)
 [![docs.rs](https://img.shields.io/docsrs/rust-diskann?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/rust_diskann/latest/rust_diskann/)
@@ -6,7 +6,7 @@
 
 A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html) using the Vamana graph algorithm, with a fixed-layout mutable mmap index for incremental insertion and in-place deletion. Deletion follows [MERIT](https://arxiv.org/abs/2607.29173): bounded recovery of approximate in-neighbors, local `k_r`-MST repair, and versioned-edge invalidation. Conflict-aware repair waves parallelize independent deletion work while preserving the order of overlapping graph updates.
 
-The original static `DiskANN` API and file format remain available and unchanged. Dynamic workloads use the separate `MmapDynamicDiskANN` type.
+The static version uses the `DiskANN` API while dynamic workloads use the separate `MmapDynamicDiskANN` type.
 
 ## Key Algorithms
 
