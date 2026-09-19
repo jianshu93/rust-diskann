@@ -29,6 +29,8 @@ This implementation follows the DiskANN paper's approach:
 - **Parallel batched graph refinement**: Uses rayon to parallelize candidate generation and batched symmetrization/re-pruning during construction for high build throughput.
 - **Build-optimized data layout**:  Uses flat contiguous storage instead of Vec<Vec<T>> during construction to improve cache locality and reduce allocation overhead.
 - **Memory-mapped on-disk index**: Stores vectors and fixed-degree adjacency lists in a single file and memory-maps it for low-overhead loading and search.
+- **Dynamic mmap index**: Converts a static index into a fixed-capacity mutable mmap with in-place batch insertion and MERIT deletion repair. The vector and `u32` adjacency regions retain the static row-major layout; edge versions, node versions, and validity bytes are appended in fixed-size regions.
+- **Parallel deletion repair**: Uses dependency-ordered, conflict-aware repair waves. Plans with disjoint candidate-node write sets run their local MST and RobustPrune work in parallel, while conflicting plans preserve deterministic update order.
 - **Beam-search query algorithm**: Uses a medoid entry point and beam search over the graph, typically visiting only a small fraction of indexed vectors
 - **Generic over vector element type and distance**: Works with generic T and any anndists::Distance<T>, supporting use cases beyond standard floating-point ANN
 - **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distances
@@ -131,6 +133,40 @@ let results: Vec<Vec<u32>> = query_batch
     .collect();
 ```
 
+### Dynamic Insert And Delete
+
+The existing `DiskANN` build and search APIs and static file format are unchanged. Dynamic updates use the separate `MmapDynamicDiskANN` type and a fixed capacity chosen when converting the static index.
+
+```rust
+use anndists::dist::DistL2;
+use rust_diskann::{DiskANN, mmap_dynamic::MmapDynamicDiskANN};
+
+let static_index = DiskANN::<f32, DistL2>::build_index_default(
+    &vectors,
+    DistL2,
+    "static.db",
+)?;
+
+let mut index = MmapDynamicDiskANN::create_from_static(
+    &static_index,
+    vectors.len() + 10_000,
+    1.2,
+    "dynamic.db",
+)?;
+
+// Independent graph searches are parallelized; adjacency commits preserve
+// deterministic conflict ordering.
+let inserted_ids = index.insert_batch(new_vectors, 128)?;
+
+// MERIT defaults: repair beam 2R and k_r = 2.
+let stats = index.delete_batch(&ids_to_delete, 2 * 48, 2);
+
+index.flush()?;
+let reopened = MmapDynamicDiskANN::<f32, DistL2>::open("dynamic.db", DistL2)?;
+```
+
+Deleted slots are reused for later inserts; insertion returns an error when the fixed capacity is exhausted. Versioned edges make stale incoming edges immediately invisible when a slot is deleted or reused. The file remains fixed-size during updates.
+
 ## Space and time complexity analysis
 
 - **Index Build Time**: O(n * max_degree * beam_width)
@@ -171,6 +207,11 @@ cargo run --release --example perf_test
 # test MNIST fashion dataset
 wget http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5
 cargo run --release --example diskann_mnist
+
+# dynamic delete-only, insert-only, and mixed update tests with a fresh
+# static rebuild baseline after every round
+cargo run --release --example merit_fashion_rebuild_baselines -- \
+    fashion-mnist-784-euclidean.hdf5
 
 # test SIFT dataset
 wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
@@ -294,6 +335,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## References
 Jayaram Subramanya, S., Devvrit, F., Simhadri, H.V., Krishnawamy, R. and Kadekodi, R., 2019. Diskann: Fast accurate billion-point nearest neighbor search on a single node. Advances in neural information processing Systems, 32.
+
+Zekai Wu, Jiabao Jin, Peng Cheng, Wangze Ni, Haoyang Li, Lei Chen, Junjie Yao, Jingkuan Song, and Heng Tao Shen. 2026. MERIT: Efficient In-Place Deletion for Dynamic Graph-Based Approximate Nearest Neighbor Indexes. [arXiv:2607.29173](https://arxiv.org/abs/2607.29173).
 
 ## Acknowledgments
 

@@ -47,6 +47,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use thiserror::Error;
 
+pub mod mmap_dynamic;
+
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
 const PAD_U32: u32 = u32::MAX;
 
