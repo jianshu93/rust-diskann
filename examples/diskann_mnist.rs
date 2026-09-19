@@ -40,8 +40,7 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 48;
     let build_beam_width = 128; // smaller beam for faster build (64–128)
     let alpha = 1.2; // standard α
-    let passes = 1usize; // refinement passes over the graph
-    let extra_seeds = 1usize; // extra random seeds per node per pass
+    let extra_seeds = 1usize; // extra random seeds per node
 
     let search_k = 10; // evaluate @k=10 (matches HNSW example)
     let search_beam = 384; // search beam: speed/recall tradeoff
@@ -59,13 +58,12 @@ fn main() -> Result<(), DiskAnnError> {
     let index = if !std::path::Path::new(index_path).exists() {
         println!(
             "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, \
-             build_beam={}, alpha={}, passes={}, extra_seeds={}",
+             build_beam={}, alpha={}, extra_seeds={}",
             train_vectors.len(),
             train_vectors[0].len(),
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds
         );
 
@@ -73,7 +71,6 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds,
         };
 

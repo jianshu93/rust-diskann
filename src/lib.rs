@@ -54,9 +54,7 @@ const PAD_U32: u32 = u32::MAX;
 pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
 pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
-/// Default number of refinement passes during graph build
-pub const DISKANN_DEFAULT_PASSES: usize = 1;
-/// Default number of extra random seeds per node per pass during graph build
+/// Default number of extra random seeds per node during graph build
 pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 1;
 
 /// Practical DiskANN-style slack before reverse-neighbor re-pruning.
@@ -64,6 +62,8 @@ pub const DISKANN_DEFAULT_EXTRA_SEEDS: usize = 1;
 /// before triggering prune, instead of pruning immediately at R.
 const GRAPH_SLACK_FACTOR: f32 = 1.3;
 
+/// Maximum candidate pool considered by RobustPrune, matching DiskANN's default.
+const MAX_OCCLUSION_SIZE: usize = 750;
 
 /// Number of nodes processed together in one micro-batch during graph build.
 ///
@@ -75,11 +75,11 @@ const GRAPH_SLACK_FACTOR: f32 = 1.3;
 /// Larger values:
 /// - are faster
 /// - but behave more like a batched graph rebuild
+///
 /// Recommended starting values:
 /// - 128 for better quality
 /// - 256 for a balanced tradeoff
 /// - 512 for faster builds
-
 const MICRO_BATCH_CHUNK_SIZE: usize = 256;
 
 /// Optional bag of knobs if you want to override just a few.
@@ -88,9 +88,7 @@ pub struct DiskAnnParams {
     pub max_degree: usize,
     pub build_beam_width: usize,
     pub alpha: f32,
-    /// Number of refinement passes over the graph (>=1).
-    pub passes: usize,
-    /// Extra random seeds per node during each pass (>=0).
+    /// Extra random seeds per node during graph construction (>=0).
     pub extra_seeds: usize,
 }
 
@@ -100,7 +98,6 @@ impl Default for DiskAnnParams {
             max_degree: DISKANN_DEFAULT_MAX_DEGREE,
             build_beam_width: DISKANN_DEFAULT_BUILD_BEAM,
             alpha: DISKANN_DEFAULT_ALPHA,
-            passes: DISKANN_DEFAULT_PASSES,
             extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
         }
     }
@@ -409,7 +406,7 @@ where
     T: bytemuck::Pod + Copy + Send + Sync + 'static,
     D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
-    /// Build with default parameters: (M=64, L=128, alpha=1.2, passes=2, extra_seeds=2).
+    /// Build with default parameters: (M=64, L=128, alpha=1.2, extra_seeds=1).
     pub fn build_index_default(
         vectors: &[Vec<T>],
         dist: D,
@@ -420,7 +417,6 @@ where
             DISKANN_DEFAULT_MAX_DEGREE,
             DISKANN_DEFAULT_BUILD_BEAM,
             DISKANN_DEFAULT_ALPHA,
-            DISKANN_DEFAULT_PASSES,
             DISKANN_DEFAULT_EXTRA_SEEDS,
             dist,
             file_path,
@@ -439,7 +435,6 @@ where
             p.max_degree,
             p.build_beam_width,
             p.alpha,
-            p.passes,
             p.extra_seeds,
             dist,
             file_path,
@@ -528,8 +523,7 @@ where
     /// * `max_degree` - Maximum edges per node (M ~ 24-64+)
     /// * `build_beam_width` - Construction L (e.g., 128-400)
     /// * `alpha` - Pruning parameter (1.2–2.0)
-    /// * `passes` - Refinement passes over the graph (>=1)
-    /// * `extra_seeds` - Extra random seeds per node per pass (>=0)
+    /// * `extra_seeds` - Extra random seeds per node (>=0)
     /// * `dist` - Any `anndists::Distance<T>`
     /// * `file_path` - Path of index file
     pub fn build_index(
@@ -537,7 +531,6 @@ where
         max_degree: usize,
         build_beam_width: usize,
         alpha: f32,
-        passes: usize,
         extra_seeds: usize,
         dist: D,
         file_path: &str,
@@ -579,7 +572,6 @@ where
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds,
             dist,
             medoid_id as u32,
@@ -760,10 +752,7 @@ fn dedup_keep_best_by_id_in_place(cands: &mut Vec<(u32, f32)>) {
         return;
     }
 
-    cands.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.total_cmp(&b.1))
-    });
+    cands.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
 
     let mut write = 0usize;
     for read in 0..cands.len() {
@@ -975,7 +964,6 @@ fn build_vamana_graph<T, D>(
     max_degree: usize,
     build_beam_width: usize,
     alpha: f32,
-    passes: usize,
     extra_seeds: usize,
     dist: D,
     medoid_id: u32,
@@ -1003,109 +991,92 @@ where
         }
     }
 
-    let passes = passes.max(1);
     let mut rng = thread_rng();
     let slack_limit = ((GRAPH_SLACK_FACTOR * max_degree as f32).ceil() as usize).max(max_degree);
 
-    // Reused across all chunks in all passes.
+    // Reused across all chunks in the single Vamana construction pass.
     let mut merge_scratch = MergeScratch::new(n);
 
-    for pass_idx in 0..passes {
-        let pass_alpha = if passes == 1 {
-            alpha
-        } else if pass_idx == 0 {
-            1.0
-        } else {
-            alpha
-        };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.shuffle(&mut rng);
 
-        let mut order: Vec<usize> = (0..n).collect();
-        order.shuffle(&mut rng);
+    for chunk in order.chunks(MICRO_BATCH_CHUNK_SIZE) {
+        let snapshot = &graph;
+        // Compute new outgoing lists for this chunk in parallel.
+        let chunk_results: Vec<(usize, Vec<u32>)> = chunk
+            .par_iter()
+            .map_init(
+                || IncrementalInsertScratch::new(n, build_beam_width, max_degree, extra_seeds),
+                |scratch, &u| {
+                    let bs = &mut scratch.build;
+                    bs.candidates.clear();
 
-        for chunk in order.chunks(MICRO_BATCH_CHUNK_SIZE) {
-            let snapshot = &graph;
-            // Compute new outgoing lists for this chunk in parallel.
-            let chunk_results: Vec<(usize, Vec<u32>)> = chunk
-                .par_iter()
-                .map_init(
-                    || IncrementalInsertScratch::new(n, build_beam_width, max_degree, extra_seeds),
-                    |scratch, &u| {
-                        let bs = &mut scratch.build;
-                        bs.candidates.clear();
+                    // Start from current adjacency.
+                    for &nb in &snapshot[u] {
+                        let d = dist.eval(vectors.row(u), vectors.row(nb as usize));
+                        bs.candidates.push((nb, d));
+                    }
 
-                        // Start from current adjacency.
-                        for &nb in &snapshot[u] {
-                            let d = dist.eval(vectors.row(u), vectors.row(nb as usize));
-                            bs.candidates.push((nb, d));
+                    // Seed list: medoid + distinct random starts.
+                    bs.seeds.clear();
+                    bs.seeds.push(medoid_id as usize);
+
+                    let mut local_rng = thread_rng();
+                    while bs.seeds.len() < 1 + extra_seeds {
+                        let s = local_rng.gen_range(0..n);
+                        if !bs.seeds.contains(&s) {
+                            bs.seeds.push(s);
                         }
+                    }
 
-                        // Seed list: medoid + distinct random starts.
-                        bs.seeds.clear();
-                        bs.seeds.push(medoid_id as usize);
+                    let seeds_len = bs.seeds.len();
+                    for si in 0..seeds_len {
+                        let start = bs.seeds[si];
 
-                        let mut local_rng = thread_rng();
-                        while bs.seeds.len() < 1 + extra_seeds {
-                            let s = local_rng.gen_range(0..n);
-                            if !bs.seeds.contains(&s) {
-                                bs.seeds.push(s);
-                            }
-                        }
-
-                        let seeds_len = bs.seeds.len();
-                        for si in 0..seeds_len {
-                            let start = bs.seeds[si];
-
-                            greedy_search_visited_collect(
-                                vectors.row(u),
-                                vectors,
-                                snapshot,
-                                start,
-                                build_beam_width,
-                                dist,
-                                bs,
-                            );
-
-                            for i in 0..bs.visited_ids.len() {
-                                bs.candidates.push((bs.visited_ids[i], bs.visited_dists[i]));
-                            }
-                        }
-
-                        dedup_keep_best_by_id_in_place(&mut bs.candidates);
-
-                        let pruned = prune_neighbors(
-                            u,
-                            &bs.candidates,
+                        greedy_search_visited_collect(
+                            vectors.row(u),
                             vectors,
-                            max_degree,
-                            pass_alpha,
+                            snapshot,
+                            start,
+                            build_beam_width,
                             dist,
+                            bs,
                         );
 
-                        (u, pruned)
-                    },
-                )
-                .collect();
+                        for i in 0..bs.visited_ids.len() {
+                            bs.candidates.push((bs.visited_ids[i], bs.visited_dists[i]));
+                        }
+                    }
 
-            let mut chunk_nodes = Vec::<usize>::with_capacity(chunk_results.len());
-            let mut chunk_pruned = Vec::<Vec<u32>>::with_capacity(chunk_results.len());
+                    dedup_keep_best_by_id_in_place(&mut bs.candidates);
 
-            for (u, pruned) in chunk_results {
-                chunk_nodes.push(u);
-                chunk_pruned.push(pruned);
-            }
-            // Merge chunk back into graph using reusable CSR-style scratch.
-            merge_chunk_updates_into_graph_reuse(
-                &mut graph,
-                &chunk_nodes,
-                &chunk_pruned,
-                vectors,
-                max_degree,
-                slack_limit,
-                pass_alpha,
-                dist,
-                &mut merge_scratch,
-            );
+                    let pruned =
+                        prune_neighbors(u, &bs.candidates, vectors, max_degree, alpha, dist);
+
+                    (u, pruned)
+                },
+            )
+            .collect();
+
+        let mut chunk_nodes = Vec::<usize>::with_capacity(chunk_results.len());
+        let mut chunk_pruned = Vec::<Vec<u32>>::with_capacity(chunk_results.len());
+
+        for (u, pruned) in chunk_results {
+            chunk_nodes.push(u);
+            chunk_pruned.push(pruned);
         }
+        // Merge chunk back into graph using reusable CSR-style scratch.
+        merge_chunk_updates_into_graph_reuse(
+            &mut graph,
+            &chunk_nodes,
+            &chunk_pruned,
+            vectors,
+            max_degree,
+            slack_limit,
+            alpha,
+            dist,
+            &mut merge_scratch,
+        );
     }
 
     // Final cleanup: enforce bounded degree and deduplication.
@@ -1197,7 +1168,7 @@ fn greedy_search_visited_collect<T, D>(
     }
 }
 
-/// α-pruning with nearest-neighbor backfill.
+/// Vamana RobustPrune with progressive alpha relaxation.
 fn prune_neighbors<T, D>(
     node_id: usize,
     candidates: &[(u32, f32)],
@@ -1217,19 +1188,16 @@ where
     // Sort by distance from node_id, nearest first.
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+    sorted.truncate(MAX_OCCLUSION_SIZE);
 
     // Remove self and duplicate ids while keeping the nearest occurrence.
     let mut uniq = Vec::<(u32, f32)>::with_capacity(sorted.len());
-    let mut last_id: Option<u32> = None;
+    let mut seen = HashSet::with_capacity(sorted.len());
     for &(cand_id, cand_dist) in &sorted {
-        if cand_id as usize == node_id {
-            continue;
-        }
-        if last_id == Some(cand_id) {
+        if cand_id as usize == node_id || !seen.insert(cand_id) {
             continue;
         }
         uniq.push((cand_id, cand_dist));
-        last_id = Some(cand_id);
     }
 
     if uniq.is_empty() {
@@ -1237,42 +1205,47 @@ where
     }
 
     let mut pruned = Vec::<u32>::with_capacity(max_degree);
+    let mut occlude_factors = vec![0.0f32; uniq.len()];
+    let target_alpha = alpha.max(1.0);
+    let increment = target_alpha.min(1.2);
+    let mut current_alpha = 1.0f32;
 
-    // Phase 1: robust α-pruning
-    for &(cand_id, cand_dist_to_node) in &uniq {
-        let mut occluded = false;
-
-        for &sel_id in &pruned {
-            let d_cand_sel = dist.eval(
-                vectors.row(cand_id as usize),
-                vectors.row(sel_id as usize),
-            );
-
-            if alpha * d_cand_sel <= cand_dist_to_node {
-                occluded = true;
-                break;
-            }
-        }
-
-        if !occluded {
-            pruned.push(cand_id);
+    loop {
+        for i in 0..uniq.len() {
             if pruned.len() >= max_degree {
                 return pruned;
             }
-        }
-    }
-
-    // Phase 2: backfill nearest remaining candidates
-    if pruned.len() < max_degree {
-        for &(cand_id, _) in &uniq {
-            if pruned.contains(&cand_id) {
+            if occlude_factors[i] > current_alpha {
                 continue;
             }
-            pruned.push(cand_id);
-            if pruned.len() >= max_degree {
-                break;
+
+            let (selected_id, _) = uniq[i];
+            occlude_factors[i] = f32::MAX;
+            pruned.push(selected_id);
+
+            for j in (i + 1)..uniq.len() {
+                if occlude_factors[j] > target_alpha {
+                    continue;
+                }
+
+                let (candidate_id, candidate_dist) = uniq[j];
+                let pair_dist = dist.eval(
+                    vectors.row(candidate_id as usize),
+                    vectors.row(selected_id as usize),
+                );
+                let factor = if pair_dist == 0.0 {
+                    f32::MAX
+                } else {
+                    candidate_dist / pair_dist
+                };
+                occlude_factors[j] = occlude_factors[j].max(factor);
             }
         }
+
+        if current_alpha >= target_alpha {
+            break;
+        }
+        current_alpha = (current_alpha * increment).min(target_alpha);
     }
 
     pruned
@@ -1281,8 +1254,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::{DistCosine, DistL2};
-    use rand::Rng;
+    use anndists::dist::{DistCosine, DistJaccard, DistL2};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::fs;
 
     fn euclid(a: &[f32], b: &[f32]) -> f32 {
@@ -1291,6 +1264,46 @@ mod tests {
             .map(|(x, y)| (x - y) * (x - y))
             .sum::<f32>()
             .sqrt()
+    }
+
+    fn exact_recall<T, D>(
+        index: &DiskANN<T, D>,
+        vectors: &[Vec<T>],
+        queries: &[Vec<T>],
+        dist: D,
+        k: usize,
+        beam: usize,
+    ) -> f32
+    where
+        T: bytemuck::Pod + Copy + Send + Sync + 'static,
+        D: Distance<T> + Send + Sync + Copy + Clone + 'static,
+    {
+        let mut hits = 0usize;
+        for query in queries {
+            let mut truth: Vec<(usize, f32)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(id, vector)| (id, dist.eval(query, vector)))
+                .collect();
+            truth.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth: HashSet<u32> = truth.into_iter().take(k).map(|(id, _)| id as u32).collect();
+
+            hits += index
+                .search(query, k, beam)
+                .into_iter()
+                .filter(|id| truth.contains(id))
+                .count();
+        }
+        hits as f32 / (queries.len() * k) as f32
+    }
+
+    fn quality_params() -> DiskAnnParams {
+        DiskAnnParams {
+            max_degree: 32,
+            build_beam_width: 128,
+            alpha: 1.2,
+            extra_seeds: 1,
+        }
     }
 
     #[test]
@@ -1361,8 +1374,7 @@ mod tests {
         ];
 
         {
-            let _idx =
-                DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
+            let _idx = DiskANN::<f32, DistL2>::build_index_default(&vectors, DistL2, path).unwrap();
         }
 
         let idx2 = DiskANN::<f32, DistL2>::open_index_default_metric(path).unwrap();
@@ -1396,7 +1408,6 @@ mod tests {
                 max_degree: 4,
                 build_beam_width: 64,
                 alpha: 1.5,
-                passes: DISKANN_DEFAULT_PASSES,
                 extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
             },
         )
@@ -1438,7 +1449,6 @@ mod tests {
                 max_degree: 32,
                 build_beam_width: 128,
                 alpha: 1.2,
-                passes: DISKANN_DEFAULT_PASSES,
                 extra_seeds: DISKANN_DEFAULT_EXTRA_SEEDS,
             },
         )
@@ -1459,6 +1469,102 @@ mod tests {
         sorted.sort_by(|a, b| a.total_cmp(b));
         assert_eq!(dists, sorted);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_regular_l2_recall() {
+        let path = "test_regular_l2_recall.db";
+        let _ = fs::remove_file(path);
+        let mut rng = StdRng::seed_from_u64(11);
+        let vectors: Vec<Vec<f32>> = (0..500)
+            .map(|_| (0..24).map(|_| rng.r#gen::<f32>()).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|_| (0..24).map(|_| rng.r#gen::<f32>()).collect())
+            .collect();
+
+        let index =
+            DiskANN::build_index_with_params(&vectors, DistL2, path, quality_params()).unwrap();
+        let recall = exact_recall(&index, &vectors, &queries, DistL2, 10, 256);
+        assert!(recall >= 0.95, "regular L2 recall was {recall}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_clustered_l2_recall() {
+        let path = "test_clustered_l2_recall.db";
+        let _ = fs::remove_file(path);
+        let mut rng = StdRng::seed_from_u64(23);
+        let dim = 24usize;
+        let clusters = 12usize;
+        let mut vectors = Vec::with_capacity(clusters * 50);
+        let mut queries = Vec::with_capacity(clusters * 3);
+
+        for cluster in 0..clusters {
+            let mut center = vec![0.0f32; dim];
+            center[cluster] = 40.0;
+            center[(cluster + 7) % dim] = -25.0;
+            for _ in 0..50 {
+                vectors.push(
+                    center
+                        .iter()
+                        .map(|value| value + rng.gen_range(-0.4f32..0.4f32))
+                        .collect(),
+                );
+            }
+            for _ in 0..3 {
+                queries.push(
+                    center
+                        .iter()
+                        .map(|value| value + rng.gen_range(-0.4f32..0.4f32))
+                        .collect(),
+                );
+            }
+        }
+
+        let index =
+            DiskANN::build_index_with_params(&vectors, DistL2, path, quality_params()).unwrap();
+        let recall = exact_recall(&index, &vectors, &queries, DistL2, 10, 256);
+        assert!(recall >= 0.95, "clustered L2 recall was {recall}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_cosine_recall() {
+        let path = "test_cosine_recall.db";
+        let _ = fs::remove_file(path);
+        let mut rng = StdRng::seed_from_u64(37);
+        let vectors: Vec<Vec<f32>> = (0..500)
+            .map(|_| (0..32).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|_| (0..32).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect())
+            .collect();
+
+        let index =
+            DiskANN::build_index_with_params(&vectors, DistCosine, path, quality_params()).unwrap();
+        let recall = exact_recall(&index, &vectors, &queries, DistCosine, 10, 256);
+        assert!(recall >= 0.95, "cosine recall was {recall}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_jaccard_recall() {
+        let path = "test_jaccard_recall.db";
+        let _ = fs::remove_file(path);
+        let mut rng = StdRng::seed_from_u64(41);
+        let vectors: Vec<Vec<u32>> = (0..400)
+            .map(|_| (0..32).map(|_| rng.gen_range(0u32..8u32)).collect())
+            .collect();
+        let queries: Vec<Vec<u32>> = (0..40)
+            .map(|_| (0..32).map(|_| rng.gen_range(0u32..8u32)).collect())
+            .collect();
+
+        let index = DiskANN::build_index_with_params(&vectors, DistJaccard, path, quality_params())
+            .unwrap();
+        let recall = exact_recall(&index, &vectors, &queries, DistJaccard, 10, 256);
+        assert!(recall >= 0.95, "Jaccard recall was {recall}");
         let _ = fs::remove_file(path);
     }
 }

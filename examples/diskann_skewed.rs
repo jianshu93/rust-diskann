@@ -52,7 +52,6 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 48;
     let build_beam_width = 256;
     let alpha = 1.2;
-    let passes = 1usize;
     let extra_seeds = 1usize;
 
     let search_k = 10;
@@ -68,13 +67,12 @@ fn main() -> Result<(), DiskAnnError> {
     let index = if !Path::new(index_path).exists() {
         println!(
             "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, \
-             build_beam={}, alpha={}, passes={}, extra_seeds={}",
+             build_beam={}, alpha={}, extra_seeds={}",
             train_vectors.len(),
             train_vectors[0].len(),
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds
         );
 
@@ -82,7 +80,6 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds,
         };
 

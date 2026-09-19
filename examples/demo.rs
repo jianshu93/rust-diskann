@@ -14,8 +14,7 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 32usize;
     let build_beam_width = 128usize;
     let alpha = 1.2f32;
-    let passes = 2usize; // refinement passes over the graph
-    let extra_seeds = 2usize; // extra random seeds per node per pass
+    let extra_seeds = 2usize; // extra random graph-search seeds per node
 
     // Build if missing
     if !Path::new(singlefile_path).exists() {
@@ -36,7 +35,6 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds,
         };
         // NOTE: DiskANN<T, D> → T = f32, D = DistCosine

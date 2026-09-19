@@ -125,20 +125,18 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 64;
     let build_beam_width = 128;
     let alpha = 1.2;
-    let passes = 1usize;      // refinement passes over the graph
-    let extra_seeds = 1usize; // extra random seeds per node per pass
+    let extra_seeds = 1usize; // extra random seeds per node
 
     let index_path = "diskann_sift1m.db";
     let index = if !std::path::Path::new(index_path).exists() {
         println!(
             "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, \
-             build_beam={}, alpha={}, passes={}, extra_seeds={}",
+             build_beam={}, alpha={}, extra_seeds={}",
             nb_elem,
             anndata.train_data[0].0.len(),
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds
         );
 
@@ -153,7 +151,6 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree,
             build_beam_width,
             alpha,
-            passes,
             extra_seeds,
         };
 

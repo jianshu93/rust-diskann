@@ -25,7 +25,7 @@ This implementation follows the DiskANN paper's approach:
         `vectors_offset` is a fixed 1 MiB gap by default.
 
 
-- **Vamana graph construction**: Builds an approximate nearest-neighbor graph with robust α-pruning and multi-pass refinement. The default build uses at least two passes, with a first diversification pass at α = 1.0 and a second refinement pass at user α (default 1.2).
+- **Vamana graph construction**: Builds an approximate nearest-neighbor graph with progressive RobustPrune. Each prune starts at α = 1.0 to preserve diverse routing edges, then relaxes toward the configured α (default 1.2). The candidate pool is capped at 750, matching the official DiskANN algorithm.
 - **Parallel batched graph refinement**: Uses rayon to parallelize candidate generation and batched symmetrization/re-pruning during construction for high build throughput.
 - **Build-optimized data layout**:  Uses flat contiguous storage instead of Vec<Vec<T>> during construction to improve cache locality and reduce allocation overhead.
 - **Memory-mapped on-disk index**: Stores vectors and fixed-degree adjacency lists in a single file and memory-maps it for low-overhead loading and search.
@@ -41,13 +41,13 @@ This implementation follows the DiskANN paper's approach:
 The Vamana graph build plot is in 2D with L2 distance. See [diskann-vamana-viz](https://github.com/jianshu93/diskann-vamana-viz) crate for details.
 
 <div align="center">
-  <img width="80%" src ="vamana_build.jpg">
+  <img width="80%" src ="vamana_build.png">
 </div>
 
 For search, the final graph was used. The path from entry node (red) to nearest node (green) for the query (pink) in the graph was labeled in orange.
 
 <div align="center">
-  <img width="40%" src ="final_graph_query.jpg">
+  <img width="40%" src ="final_graph_query.png">
 </div>
 
 ## Usage in Rust 🦀
@@ -72,9 +72,7 @@ let params = DiskAnnParams {
     max_degree: 48,        // max neighbors per node
     build_beam_width: 128, // construction beam width
     alpha: 1.2,            // α for pruning
-    passes: 2,             // number of initial passes 
-    extra_seeds: 2,        // number of extra refinement
-
+    extra_seeds: 2,        // extra graph-search seeds per node
 };
 let index2 = DiskANN::<f32, DistCosine>::build_index_with_params(
     &vectors,
@@ -216,7 +214,7 @@ Train size : 1000000
 Test size  : 10000
 Ground-truth k per query in file: 100
 
-Building DiskANN index: n=1000000, dim=128, max_degree=64, build_beam=128, alpha=1.2, passes=1, extra_seeds=1
+Building DiskANN index: n=1000000, dim=128, max_degree=64, build_beam=128, alpha=1.2, extra_seeds=1
 Build complete. CPU time: 3906.747201985s, wall time: 3916.977265733s
 
 Searching 10000 queries with k=10, beam_width=512 …
@@ -299,4 +297,4 @@ Jayaram Subramanya, S., Devvrit, F., Simhadri, H.V., Krishnawamy, R. and Kadekod
 
 ## Acknowledgments
 
-This implementation is based on the DiskANN paper and the official Microsoft implementation. It was also largely inspired by the implementation [here](https://github.com/lukaesch/diskann-rs). 
+This implementation is based on the DiskANN paper and the official Microsoft implementation. It was also largely inspired by the implementation [here](https://github.com/lukaesch/diskann-rs).

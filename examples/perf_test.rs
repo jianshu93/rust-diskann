@@ -12,7 +12,6 @@ fn main() -> Result<(), DiskAnnError> {
     const MAX_DEGREE: usize = 32;
     const BUILD_BEAM_WIDTH: usize = 128;
     const ALPHA: f32 = 1.2;
-    const PASSES: usize = 2;
     const EXTRA_SEEDS: usize = 2;
 
     let singlefile_path = "diskann_large.db";
@@ -21,14 +20,13 @@ fn main() -> Result<(), DiskAnnError> {
     if !std::path::Path::new(singlefile_path).exists() {
         println!(
             "Building DiskANN index with {} vectors, dim={}, distance={}, \
-             max_degree={}, build_beam={}, alpha={}, passes={}, extra_seeds={}",
+             max_degree={}, build_beam={}, alpha={}, extra_seeds={}",
             NUM_VECTORS,
             DIM,
             std::any::type_name::<DistCosine>(),
             MAX_DEGREE,
             BUILD_BEAM_WIDTH,
             ALPHA,
-            PASSES,
             EXTRA_SEEDS
         );
 
@@ -51,7 +49,6 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree: MAX_DEGREE,
             build_beam_width: BUILD_BEAM_WIDTH,
             alpha: ALPHA,
-            passes: PASSES,
             extra_seeds: EXTRA_SEEDS,
         };
 
