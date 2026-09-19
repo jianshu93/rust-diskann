@@ -1,12 +1,16 @@
-# DiskANN: On-disk graph-based approximate nearest neighbor search 🦀
+# Dynamic DiskANN: Memory-Mapped ANN Search with In-Place Insert and Delete 🦀
 
 [![Latest Version](https://img.shields.io/crates/v/rust_diskann?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/rust_diskann)
 [![docs.rs](https://img.shields.io/docsrs/rust-diskann?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/rust_diskann/latest/rust_diskann/)
 
 
-A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html) (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. This project provides an efficient and scalable solution for large-scale vector similarity search with minimal memory footprint, as an alternative to the widely used in-memory [HNSW](https://ieeexplore.ieee.org/abstract/document/8594636) algorithm. 
+A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html) using the Vamana graph algorithm, with a fixed-layout mutable mmap index for incremental insertion and in-place deletion. Deletion follows [MERIT](https://arxiv.org/abs/2607.29173): bounded recovery of approximate in-neighbors, local `k_r`-MST repair, and versioned-edge invalidation. Conflict-aware repair waves parallelize independent deletion work while preserving the order of overlapping graph updates.
 
-## Key algorithm
+The original static `DiskANN` API and file format remain available and unchanged. Dynamic workloads use the separate `MmapDynamicDiskANN` type.
+
+## Key Algorithms
+
+### Static Vamana Construction
 
 This implementation follows the DiskANN paper's approach:
 - Using the Vamana graph algorithm for index construction, pruning and refinement (in parallel)
@@ -14,6 +18,33 @@ This implementation follows the DiskANN paper's approach:
 - Implementing beam search with medoid entry points (in parallel)
 - Supporting Euclidean, Cosine, Hamming and other distance metrics via a generic distance trait
 - Maintaining minimal memory footprint during search operations
+
+### Dynamic MERIT Deletion
+
+Dynamic deletion follows the MERIT algorithm:
+
+1. Logically invalidate the deleted node so it disappears from search immediately.
+2. Combine its outgoing neighbors with approximate in-neighbors recovered by a bounded graph search.
+3. Reconnect the local candidate set with incremental `k_r`-MST repair and RobustPrune.
+4. Increment the deleted slot's version so all stale incoming edges become invalid without a graph-wide scan.
+5. Reuse the deleted fixed-capacity slot for a later insertion.
+
+For batch deletion, repair plans declare their candidate-node write sets. Plans with no overlapping writes run in parallel within the same dependency wave. Conflicting plans run in ordered waves, preventing lost adjacency updates without unsafe concurrent mmap writes.
+
+### Dynamic Mmap Layout
+
+The dynamic index keeps fixed-offset regions in one file:
+
+```text
+[ metadata and padding to 1 MiB ]
+[ vectors: capacity * dim * sizeof(T) ]
+[ adjacency targets: capacity * R * u32 ]
+[ edge versions: capacity * R * u16 ]
+[ node versions: capacity * u16 ]
+[ validity bytes: capacity * u8 ]
+```
+
+The vector and `u32` adjacency regions retain the static row-major organization. Updates modify fixed slots in place, so the dynamic index file does not grow during insertion and deletion.
 
 ## Features
 
@@ -29,8 +60,10 @@ This implementation follows the DiskANN paper's approach:
 - **Parallel batched graph refinement**: Uses rayon to parallelize candidate generation and batched symmetrization/re-pruning during construction for high build throughput.
 - **Build-optimized data layout**:  Uses flat contiguous storage instead of Vec<Vec<T>> during construction to improve cache locality and reduce allocation overhead.
 - **Memory-mapped on-disk index**: Stores vectors and fixed-degree adjacency lists in a single file and memory-maps it for low-overhead loading and search.
-- **Dynamic mmap index**: Converts a static index into a fixed-capacity mutable mmap with in-place batch insertion and MERIT deletion repair. The vector and `u32` adjacency regions retain the static row-major layout; edge versions, node versions, and validity bytes are appended in fixed-size regions.
-- **Parallel deletion repair**: Uses dependency-ordered, conflict-aware repair waves. Plans with disjoint candidate-node write sets run their local MST and RobustPrune work in parallel, while conflicting plans preserve deterministic update order.
+- **MERIT in-place deletion**: Uses bounded in-neighbor recovery, local `k_r`-MST repair, and versioned-edge invalidation to maintain graph connectivity without rebuilding the index.
+- **Dynamic mmap index**: Converts a static index into a fixed-capacity mutable mmap supporting `insert`, `insert_batch`, `delete`, and `delete_batch`.
+- **Conflict-aware parallel repair**: Executes disjoint deletion repair plans concurrently while preserving deterministic ordering for overlapping candidate-node writes.
+- **Stale-edge safety**: Stores edge and node versions in parallel fixed-size regions, preventing old incoming edges from becoming valid when a deleted slot is reused.
 - **Beam-search query algorithm**: Uses a medoid entry point and beam search over the graph, typically visiting only a small fraction of indexed vectors
 - **Generic over vector element type and distance**: Works with generic T and any anndists::Distance<T>, supporting use cases beyond standard floating-point ANN
 - **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distances
