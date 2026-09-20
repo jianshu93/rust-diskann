@@ -675,18 +675,19 @@ where
         let dynamic = self.dynamic.as_ref().ok_or_else(|| {
             DiskAnnError::IndexError("commit requires a dynamic update session".into())
         })?;
-        let (vectors, graph, medoid_id, id_map) = dynamic.static_snapshot();
+        let (live, remap, medoid_id, id_map) = dynamic.static_layout();
         let work_path = dynamic.work_path().to_path_buf();
-        if vectors.is_empty() {
+        if live.is_empty() {
             return Err(DiskAnnError::IndexError(
                 "cannot commit an empty static index".into(),
             ));
         }
         let temporary = format!("{path}.static-commit-{}", std::process::id());
         let dist = self.dist;
-        let result = write_static_graph(
-            &vectors,
-            &graph,
+        let result = write_static_graph_streaming(
+            dynamic,
+            &live,
+            &remap,
             self.max_degree,
             medoid_id,
             &self.distance_name,
@@ -702,22 +703,22 @@ where
     }
 }
 
-fn write_static_graph<T: bytemuck::Pod>(
-    vectors: &[Vec<T>],
-    graph: &[Vec<u32>],
+fn write_static_graph_streaming<T, D>(
+    dynamic: &mmap_dynamic::MmapDynamicDiskANN<T, D>,
+    live: &[u32],
+    remap: &[u32],
     max_degree: usize,
     medoid_id: u32,
     distance_name: &str,
     path: &str,
-) -> Result<(), DiskAnnError> {
-    let dim = vectors[0].len();
-    if vectors.iter().any(|vector| vector.len() != dim) || graph.len() != vectors.len() {
-        return Err(DiskAnnError::IndexError(
-            "invalid static snapshot dimensions".into(),
-        ));
-    }
+) -> Result<(), DiskAnnError>
+where
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync + Copy + Clone + 'static,
+{
+    let dim = dynamic.dim();
     let vectors_offset = 1024 * 1024u64;
-    let adjacency_offset = vectors_offset + (vectors.len() * dim * std::mem::size_of::<T>()) as u64;
+    let adjacency_offset = vectors_offset + (live.len() * dim * std::mem::size_of::<T>()) as u64;
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -725,22 +726,26 @@ fn write_static_graph<T: bytemuck::Pod>(
         .write(true)
         .open(path)?;
     file.seek(SeekFrom::Start(vectors_offset))?;
-    for vector in vectors {
-        file.write_all(bytemuck::cast_slice(vector))?;
+    for old_id in live {
+        file.write_all(bytemuck::cast_slice(dynamic.vector_slice(*old_id)))?;
     }
     file.seek(SeekFrom::Start(adjacency_offset))?;
-    for neighbors in graph {
-        let mut row = neighbors
-            .iter()
-            .copied()
-            .take(max_degree)
-            .collect::<Vec<_>>();
+    let mut row = Vec::with_capacity(max_degree);
+    for old_id in live {
+        row.clear();
+        row.extend(
+            dynamic
+                .live_neighbors(*old_id)
+                .into_iter()
+                .map(|old| remap[old as usize])
+                .filter(|new| *new != PAD_U32),
+        );
         row.resize(max_degree, PAD_U32);
         file.write_all(bytemuck::cast_slice(&row))?;
     }
     let metadata = Metadata {
         dim,
-        num_vectors: vectors.len(),
+        num_vectors: live.len(),
         max_degree,
         medoid_id,
         vectors_offset,

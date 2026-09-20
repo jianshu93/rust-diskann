@@ -178,7 +178,7 @@ where
         self.vector(id as u32).to_vec()
     }
 
-    pub(crate) fn static_snapshot(&self) -> (Vec<Vec<T>>, Vec<Vec<u32>>, u32, Vec<Option<u32>>) {
+    pub(crate) fn static_layout(&self) -> (Vec<u32>, Vec<u32>, u32, Vec<Option<u32>>) {
         let live = (0..self.meta.capacity)
             .map(|id| id as u32)
             .filter(|id| self.is_valid(*id))
@@ -187,27 +187,16 @@ where
         for (new_id, old_id) in live.iter().enumerate() {
             remap[*old_id as usize] = new_id as u32;
         }
-        let vectors = live
-            .iter()
-            .map(|id| self.vector(*id).to_vec())
-            .collect::<Vec<_>>();
-        let graph = live
-            .iter()
-            .map(|id| {
-                self.live_neighbors(*id)
-                    .into_iter()
-                    .filter_map(|old| {
-                        let new = remap[old as usize];
-                        (new != PAD_U32).then_some(new)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
         let id_map = remap
             .iter()
             .map(|id| (*id != PAD_U32).then_some(*id))
             .collect();
-        (vectors, graph, remap[self.meta.medoid_id as usize], id_map)
+        let medoid = remap[self.meta.medoid_id as usize];
+        (live, remap, medoid, id_map)
+    }
+
+    pub(crate) fn vector_slice(&self, id: u32) -> &[T] {
+        self.vector(id)
     }
 
     pub(crate) fn work_path(&self) -> &Path {
@@ -454,7 +443,7 @@ where
             }
         })
     }
-    fn live_neighbors(&self, id: u32) -> Vec<u32> {
+    pub(crate) fn live_neighbors(&self, id: u32) -> Vec<u32> {
         self.raw_edges(id)
             .filter(|(t, v)| self.is_valid(*t) && self.node_version(*t) == *v)
             .map(|x| x.0)
