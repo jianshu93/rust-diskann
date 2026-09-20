@@ -1,0 +1,4 @@
+/target/
+/data/*.hdf5
+/*.db
+/*.work

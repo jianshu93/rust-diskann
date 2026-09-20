@@ -4,9 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/rust-diskann?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/rust_diskann/latest/rust_diskann/)
 
 
-A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html) using the Vamana graph algorithm, with a fixed-layout mutable mmap index for incremental insertion and in-place deletion. Deletion follows [MERIT](https://arxiv.org/abs/2607.29173): bounded recovery of approximate in-neighbors, local `k_r`-MST repair, and versioned-edge invalidation. Conflict-aware repair waves parallelize independent deletion work while preserving the order of overlapping graph updates.
-
-The static version uses the `DiskANN` API while dynamic workloads use the separate `MmapDynamicDiskANN` type.
+A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html) using the Vamana graph algorithm. `DiskANN` indexes are always stored and served in the original static mmap format. Updates run in a temporary fixed-layout mmap session and are committed back to a cleaned static index. Deletion follows [MERIT](https://arxiv.org/abs/2607.29173): bounded recovery of approximate in-neighbors, local `k_r`-MST repair, and versioned-edge invalidation during the update session.
 
 ## Key Algorithms
 
@@ -31,9 +29,9 @@ Dynamic deletion follows the MERIT algorithm:
 
 For batch deletion, repair plans declare their candidate-node write sets. Plans with no overlapping writes run in parallel within the same dependency wave. Conflicting plans run in ordered waves, preventing lost adjacency updates without unsafe concurrent mmap writes.
 
-### Dynamic Mmap Layout
+### Transient Update Layout
 
-The dynamic index keeps fixed-offset regions in one file:
+The temporary update workspace keeps fixed-offset regions in one file:
 
 ```text
 [ metadata and padding to 1 MiB ]
@@ -44,7 +42,9 @@ The dynamic index keeps fixed-offset regions in one file:
 [ validity bytes: capacity * u8 ]
 ```
 
-The vector and `u32` adjacency regions retain the static row-major organization. Updates modify fixed slots in place, so the dynamic index file does not grow during insertion and deletion.
+The vector and `u32` adjacency regions retain the static row-major organization. On commit, only live vectors and live version-matching edges are compacted into the ordinary static layout; the temporary workspace is removed. Search-only processes therefore never need validity or version state.
+
+Commit is a sequential pass over the workspace followed by a sequential write of the surviving vectors and adjacency lists. For the intended workload, where each transaction deletes only a small fraction of the database, this is substantially simpler and normally much faster than constructing a fresh Vamana graph. The Fashion-MNIST update example reports the complete update-plus-commit time separately from fresh rebuild time.
 
 ## Features
 
@@ -61,7 +61,7 @@ The vector and `u32` adjacency regions retain the static row-major organization.
 - **Build-optimized data layout**:  Uses flat contiguous storage instead of Vec<Vec<T>> during construction to improve cache locality and reduce allocation overhead.
 - **Memory-mapped on-disk index**: Stores vectors and fixed-degree adjacency lists in a single file and memory-maps it for low-overhead loading and search.
 - **MERIT in-place deletion**: Uses bounded in-neighbor recovery, local `k_r`-MST repair, and versioned-edge invalidation to maintain graph connectivity without rebuilding the index.
-- **Dynamic mmap index**: Converts a static index into a fixed-capacity mutable mmap supporting `insert`, `insert_batch`, `delete`, and `delete_batch`.
+- **Transactional updates**: Opens a static index as a fixed-capacity temporary update session supporting `insert`, `insert_batch`, `delete`, and `delete_batch`, then commits an ordinary static index.
 - **Conflict-aware parallel repair**: Executes disjoint deletion repair plans concurrently while preserving deterministic ordering for overlapping candidate-node writes.
 - **Stale-edge safety**: Stores edge and node versions in parallel fixed-size regions, preventing old incoming edges from becoming valid when a deleted slot is reused.
 - **Beam-search query algorithm**: Uses a medoid entry point and beam search over the graph, typically visiting only a small fraction of indexed vectors
@@ -166,13 +166,13 @@ let results: Vec<Vec<u32>> = query_batch
     .collect();
 ```
 
-### Dynamic Insert And Delete
+### Insert And Delete Transaction
 
-The existing `DiskANN` build and search APIs and static file format are unchanged. Dynamic updates use the separate `MmapDynamicDiskANN` type and a fixed capacity chosen when converting the static index.
+The static file format and search API remain unchanged. `begin_updates` creates a temporary workspace with a fixed capacity. `commit_updates_to_static` filters stale edges, compacts live IDs, atomically replaces the destination, removes the workspace, and returns a normal static `DiskANN` handle.
 
 ```rust
 use anndists::dist::DistL2;
-use rust_diskann::{DiskANN, mmap_dynamic::MmapDynamicDiskANN};
+use rust_diskann::DiskANN;
 
 let static_index = DiskANN::<f32, DistL2>::build_index_default(
     &vectors,
@@ -180,25 +180,27 @@ let static_index = DiskANN::<f32, DistL2>::build_index_default(
     "static.db",
 )?;
 
-let mut index = MmapDynamicDiskANN::create_from_static(
+let mut update = DiskANN::begin_updates(
     &static_index,
     vectors.len() + 10_000,
     1.2,
-    "dynamic.db",
+    "index.update-work",
 )?;
 
 // Independent graph searches are parallelized; adjacency commits preserve
 // deterministic conflict ordering.
-let inserted_ids = index.insert_batch(new_vectors, 128)?;
+let inserted_ids = update.insert_batch(new_vectors, 128)?;
 
 // MERIT defaults: repair beam 2R and k_r = 2.
-let stats = index.delete_batch(&ids_to_delete, 2 * 48, 2);
+let stats = update.delete_batch(&ids_to_delete, 2 * 48, 2)?;
 
-index.flush()?;
-let reopened = MmapDynamicDiskANN::<f32, DistL2>::open("dynamic.db", DistL2)?;
+drop(static_index);
+let (index, old_to_new_id) = update.commit_updates_to_static("static.db")?;
+// `index` is now an ordinary static index; no version state is needed to search.
+// `old_to_new_id[old_slot]` records ID compaction; deleted slots map to `None`.
 ```
 
-Deleted slots are reused for later inserts; insertion returns an error when the fixed capacity is exhausted. Versioned edges make stale incoming edges immediately invisible when a slot is deleted or reused. The file remains fixed-size during updates.
+Deleted slots are reused for later inserts; insertion returns an error when the transaction capacity is exhausted. Versioned edges make stale incoming edges immediately invisible during repair and slot reuse. Commit performs the graph-wide sequential cleanup required to remove those versions safely from the final static file.
 
 ## Space and time complexity analysis
 
@@ -241,15 +243,44 @@ cargo run --release --example perf_test
 wget http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5
 cargo run --release --example diskann_mnist
 
-# dynamic delete-only, insert-only, and mixed update tests with a fresh
+# transactional delete-only, insert-only, and mixed update tests; every round
+# commits and reopens a static index before comparison with a fresh rebuild
 # static rebuild baseline after every round
 cargo run --release --example merit_fashion_rebuild_baselines -- \
     fashion-mnist-784-euclidean.hdf5
+
+# Optional second argument selects update batch size; 60 is 0.1% of 60,000.
+cargo run --release --example merit_fashion_rebuild_baselines -- \
+    fashion-mnist-784-euclidean.hdf5 60
 
 # test SIFT dataset
 wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
 cargo run --release --example diskann_sift
 ```
+
+### Fashion-MNIST Transaction Results
+
+Version 0.4.1 was tested on all 60,000 Fashion-MNIST vectors (`R=48`, build beam `128`, batches of 3,000). Every round starts from a static index, creates a temporary update workspace, commits a standard static index, and evaluates that committed index against a fresh rebuild over exactly the same active vectors.
+
+At search beam 128:
+
+| Scenario | Rounds | Fresh rebuild | Update + static commit | Speedup | Recall delta range |
+|---|---:|---:|---:|---:|---:|
+| Delete only | 1-5 | 11.20-13.79 s | 3.51-5.01 s | 2.75-3.19x | -0.00005 to +0.00001 |
+| Insert only | 1-5 | 10.72-14.02 s | 6.04-6.57 s | 1.63-2.32x | -0.00004 to +0.00012 |
+| Delete + insert | 1-5 | 10.12-10.53 s | 7.68-10.24 s | 0.99-1.35x | -0.00006 to +0.00003 |
+
+The commit cost includes scanning the workspace, filtering version-mismatched edges, compacting IDs, writing all surviving vectors and adjacency lists, removing the workspace, and reopening the result through the ordinary static loader. The benchmark writes detailed per-round results to `merit_fashion_rebuild_baselines.csv`.
+
+For small 0.1% update batches (60 vectors per round), the same benchmark shows the expected larger advantage:
+
+| Scenario | Fresh rebuild | Update + static commit | Mean speedup | Recall delta at beam 128 |
+|---|---:|---:|---:|---:|
+| Delete only | 13.18-14.42 s | 0.52-0.61 s | 24.51x | -0.00007 to +0.00008 |
+| Insert only | 9.35-9.87 s | 0.42-0.48 s | 21.54x | 0.00000 to +0.00008 |
+| Delete + insert | 9.31-9.61 s | 0.51-0.59 s | 17.08x | -0.00002 to +0.00003 |
+
+These timings are from one local run and include the complete static commit. They demonstrate why the transactional design is most useful when each update touches a small fraction of a large index.
 
 
 ## Examples

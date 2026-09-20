@@ -47,7 +47,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use thiserror::Error;
 
-pub mod mmap_dynamic;
+mod mmap_dynamic;
+pub use mmap_dynamic::DeleteStats;
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
 const PAD_U32: u32 = u32::MAX;
@@ -136,9 +137,55 @@ struct Metadata {
 
 /// Candidate for search/frontier queues
 #[derive(Clone, Copy, Debug)]
-struct Candidate {
+pub(crate) struct Candidate {
     dist: f32,
     id: u32,
+}
+
+/// One beam-search implementation shared by legacy static and dynamic storage.
+/// Storage adapters provide distances and the currently visible neighbor view.
+pub(crate) fn graph_search(
+    start_id: u32,
+    beam_width: usize,
+    mut distance: impl FnMut(u32) -> f32,
+    mut neighbors: impl FnMut(u32) -> Vec<u32>,
+) -> Vec<Candidate> {
+    let beam_width = beam_width.max(1);
+    let start = Candidate {
+        dist: distance(start_id),
+        id: start_id,
+    };
+    let mut visited = HashSet::from([start_id]);
+    let mut frontier = BinaryHeap::from([Reverse(start)]);
+    let mut work = BinaryHeap::from([start]);
+
+    while let Some(Reverse(best)) = frontier.peek().copied() {
+        if work.len() >= beam_width && best.dist >= work.peek().unwrap().dist {
+            break;
+        }
+        let Reverse(current) = frontier.pop().unwrap();
+        for neighbor in neighbors(current.id) {
+            if !visited.insert(neighbor) {
+                continue;
+            }
+            let candidate = Candidate {
+                dist: distance(neighbor),
+                id: neighbor,
+            };
+            if work.len() < beam_width {
+                work.push(candidate);
+                frontier.push(Reverse(candidate));
+            } else if candidate.dist < work.peek().unwrap().dist {
+                work.pop();
+                work.push(candidate);
+                frontier.push(Reverse(candidate));
+            }
+        }
+    }
+
+    let mut results = work.into_vec();
+    results.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+    results
 }
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
@@ -392,7 +439,10 @@ where
     adjacency_offset: u64,
 
     /// Memory-mapped file
-    mmap: Mmap,
+    mmap: Option<Mmap>,
+
+    /// Dynamic-v2 storage when this index was opened or built for updates.
+    dynamic: Option<mmap_dynamic::MmapDynamicDiskANN<T, D>>,
 
     /// The distance strategy
     dist: D,
@@ -408,6 +458,22 @@ where
     T: bytemuck::Pod + Copy + Send + Sync + 'static,
     D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
+    fn from_dynamic(dynamic: mmap_dynamic::MmapDynamicDiskANN<T, D>, dist: D) -> Self {
+        Self {
+            dim: dynamic.dim(),
+            num_vectors: dynamic.len(),
+            max_degree: dynamic.max_degree(),
+            distance_name: dynamic.distance_name().to_string(),
+            medoid_id: dynamic.medoid_id(),
+            vectors_offset: 0,
+            adjacency_offset: 0,
+            mmap: None,
+            dynamic: Some(dynamic),
+            dist,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Build with default parameters: (M=64, L=128, alpha=1.2, extra_seeds=1).
     pub fn build_index_default(
         vectors: &[Vec<T>],
@@ -486,11 +552,196 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
-            mmap,
+            mmap: Some(mmap),
+            dynamic: None,
             dist,
             _phantom: PhantomData,
         })
     }
+
+    /// Starts a transient update session from a static index.
+    /// Commit it with `commit_updates_to_static`; the work file is not a
+    /// persistent index format and is never accepted by `open_index_with`.
+    pub fn begin_updates(
+        index: &Self,
+        capacity: usize,
+        alpha: f32,
+        path: &str,
+    ) -> Result<Self, DiskAnnError> {
+        if index.dynamic.is_some() {
+            return Err(DiskAnnError::IndexError(
+                "source index is already dynamic".into(),
+            ));
+        }
+        let dynamic =
+            mmap_dynamic::MmapDynamicDiskANN::create_from_static(index, capacity, alpha, path)?;
+        Ok(Self::from_dynamic(dynamic, index.dist))
+    }
+
+    /// True while this handle is a transient update session.
+    pub fn is_updating(&self) -> bool {
+        self.dynamic.is_some()
+    }
+
+    /// Number of addressable slots. Static-v1 capacity equals its vector count.
+    pub fn capacity(&self) -> usize {
+        self.dynamic
+            .as_ref()
+            .map_or(self.num_vectors, |dynamic| dynamic.capacity())
+    }
+
+    /// Inserts one vector during a transient update session.
+    pub fn insert(&mut self, vector: Vec<T>, beam: usize) -> Result<u32, DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_mut()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        let id = dynamic.insert(vector, beam)?;
+        self.num_vectors = dynamic.len();
+        Ok(id)
+    }
+
+    /// Inserts a batch during a transient update session.
+    pub fn insert_batch(
+        &mut self,
+        vectors: Vec<Vec<T>>,
+        beam: usize,
+    ) -> Result<Vec<u32>, DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_mut()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        let ids = dynamic.insert_batch(vectors, beam)?;
+        self.num_vectors = dynamic.len();
+        Ok(ids)
+    }
+
+    /// Deletes one node and repairs its neighborhood with MERIT.
+    pub fn delete(
+        &mut self,
+        id: u32,
+        repair_beam: usize,
+        repair_degree: usize,
+    ) -> Result<Option<DeleteStats>, DiskAnnError> {
+        let mut stats = self.delete_batch(&[id], repair_beam, repair_degree)?;
+        Ok(stats.pop())
+    }
+
+    /// Deletes a batch using conflict-aware parallel MERIT repair waves.
+    pub fn delete_batch(
+        &mut self,
+        ids: &[u32],
+        repair_beam: usize,
+        repair_degree: usize,
+    ) -> Result<Vec<DeleteStats>, DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_mut()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        let stats = dynamic.delete_batch(ids, repair_beam, repair_degree);
+        self.num_vectors = dynamic.len();
+        Ok(stats)
+    }
+
+    /// Flushes pending update-workspace writes. Static handles are read-only.
+    pub fn flush(&self) -> Result<(), DiskAnnError> {
+        if let Some(dynamic) = &self.dynamic {
+            dynamic.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Commits a dynamic update session as a legacy static-v1 index.
+    ///
+    /// Only live vectors and live, version-matching edges are written. IDs are
+    /// compacted to `0..num_vectors`; the returned handle uses the ordinary
+    /// static search format and contains no validity or version arrays.
+    pub fn commit_updates_to_static(
+        self,
+        path: &str,
+    ) -> Result<(Self, Vec<Option<u32>>), DiskAnnError> {
+        let dynamic = self.dynamic.as_ref().ok_or_else(|| {
+            DiskAnnError::IndexError("commit requires a dynamic update session".into())
+        })?;
+        let (vectors, graph, medoid_id, id_map) = dynamic.static_snapshot();
+        let work_path = dynamic.work_path().to_path_buf();
+        if vectors.is_empty() {
+            return Err(DiskAnnError::IndexError(
+                "cannot commit an empty static index".into(),
+            ));
+        }
+        let temporary = format!("{path}.static-commit-{}", std::process::id());
+        let dist = self.dist;
+        let result = write_static_graph(
+            &vectors,
+            &graph,
+            self.max_degree,
+            medoid_id,
+            &self.distance_name,
+            &temporary,
+        );
+        drop(self);
+        result?;
+        std::fs::rename(&temporary, path)?;
+        if work_path != std::path::Path::new(path) {
+            let _ = std::fs::remove_file(work_path);
+        }
+        Ok((Self::open_index_with(path, dist)?, id_map))
+    }
+}
+
+fn write_static_graph<T: bytemuck::Pod>(
+    vectors: &[Vec<T>],
+    graph: &[Vec<u32>],
+    max_degree: usize,
+    medoid_id: u32,
+    distance_name: &str,
+    path: &str,
+) -> Result<(), DiskAnnError> {
+    let dim = vectors[0].len();
+    if vectors.iter().any(|vector| vector.len() != dim) || graph.len() != vectors.len() {
+        return Err(DiskAnnError::IndexError(
+            "invalid static snapshot dimensions".into(),
+        ));
+    }
+    let vectors_offset = 1024 * 1024u64;
+    let adjacency_offset = vectors_offset + (vectors.len() * dim * std::mem::size_of::<T>()) as u64;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.seek(SeekFrom::Start(vectors_offset))?;
+    for vector in vectors {
+        file.write_all(bytemuck::cast_slice(vector))?;
+    }
+    file.seek(SeekFrom::Start(adjacency_offset))?;
+    for neighbors in graph {
+        let mut row = neighbors
+            .iter()
+            .copied()
+            .take(max_degree)
+            .collect::<Vec<_>>();
+        row.resize(max_degree, PAD_U32);
+        file.write_all(bytemuck::cast_slice(&row))?;
+    }
+    let metadata = Metadata {
+        dim,
+        num_vectors: vectors.len(),
+        max_degree,
+        medoid_id,
+        vectors_offset,
+        adjacency_offset,
+        elem_size: std::mem::size_of::<T>() as u8,
+        distance_name: distance_name.to_owned(),
+    };
+    let bytes = bincode::serialize(&metadata)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Extra sugar when your distance type implements `Default`.
@@ -618,7 +869,8 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
-            mmap,
+            mmap: Some(mmap),
+            dynamic: None,
             dist,
             _phantom: PhantomData,
         })
@@ -627,6 +879,9 @@ where
     /// Searches the index for nearest neighbors using a best-first beam search.
     /// Termination rule: continue while the best frontier can still improve the worst in working set.
     pub fn search_with_dists(&self, query: &[T], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
+        if let Some(dynamic) = &self.dynamic {
+            return dynamic.search_with_dists(query, k, beam_width);
+        }
         assert_eq!(
             query.len(),
             self.dim,
@@ -635,53 +890,18 @@ where
             self.dim
         );
 
-        let mut visited = HashSet::new();
-        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-        let mut w: BinaryHeap<Candidate> = BinaryHeap::new();
-
-        let start_dist = self.distance_to(query, self.medoid_id as usize);
-        let start = Candidate {
-            dist: start_dist,
-            id: self.medoid_id,
-        };
-        frontier.push(Reverse(start));
-        w.push(start);
-        visited.insert(self.medoid_id);
-
-        while let Some(Reverse(best)) = frontier.peek().copied() {
-            if w.len() >= beam_width {
-                if let Some(worst) = w.peek() {
-                    if best.dist >= worst.dist {
-                        break;
-                    }
-                }
-            }
-            let Reverse(current) = frontier.pop().unwrap();
-
-            for &nb in self.get_neighbors(current.id) {
-                if nb == PAD_U32 {
-                    continue;
-                }
-                if !visited.insert(nb) {
-                    continue;
-                }
-
-                let d = self.distance_to(query, nb as usize);
-                let cand = Candidate { dist: d, id: nb };
-
-                if w.len() < beam_width {
-                    w.push(cand);
-                    frontier.push(Reverse(cand));
-                } else if d < w.peek().unwrap().dist {
-                    w.pop();
-                    w.push(cand);
-                    frontier.push(Reverse(cand));
-                }
-            }
-        }
-
-        let mut results: Vec<_> = w.into_vec();
-        results.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+        let mut results = graph_search(
+            self.medoid_id,
+            beam_width,
+            |id| self.distance_to(query, id as usize),
+            |id| {
+                self.get_neighbors(id)
+                    .iter()
+                    .copied()
+                    .filter(|neighbor| *neighbor != PAD_U32)
+                    .collect()
+            },
+        );
         results.truncate(k);
         results.into_iter().map(|c| (c.id, c.dist)).collect()
     }
@@ -699,7 +919,7 @@ where
         let offset = self.adjacency_offset + (node_id as u64 * self.max_degree as u64 * 4);
         let start = offset as usize;
         let end = start + (self.max_degree * 4);
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.mmap.as_ref().expect("static mmap missing")[start..end];
         bytemuck::cast_slice(bytes)
     }
 
@@ -709,18 +929,21 @@ where
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * elem_sz as u64);
         let start = offset as usize;
         let end = start + (self.dim * elem_sz);
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.mmap.as_ref().expect("static mmap missing")[start..end];
         let vector: &[T] = bytemuck::cast_slice(bytes);
         self.dist.eval(query, vector)
     }
 
     /// Gets a vector from the index
     pub fn get_vector(&self, idx: usize) -> Vec<T> {
+        if let Some(dynamic) = &self.dynamic {
+            return dynamic.get_vector(idx);
+        }
         let elem_sz = std::mem::size_of::<T>();
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * elem_sz as u64);
         let start = offset as usize;
         let end = start + (self.dim * elem_sz);
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.mmap.as_ref().expect("static mmap missing")[start..end];
         let vector: &[T] = bytemuck::cast_slice(bytes);
         vector.to_vec()
     }
@@ -1331,6 +1554,38 @@ mod tests {
         assert!(euclid(&q, &v) < 1.0);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_session_commits_as_ordinary_static_index() {
+        let static_path = "test_update_commit_static.db";
+        let work_path = "test_update_commit_work.db";
+        let _ = fs::remove_file(static_path);
+        let _ = fs::remove_file(work_path);
+        let vectors = (0..200)
+            .map(|id| vec![id as f32, (id % 11) as f32])
+            .collect::<Vec<_>>();
+        let static_index = DiskANN::build_index_default(&vectors, DistL2, static_path).unwrap();
+        let mut update = DiskANN::begin_updates(&static_index, 220, 1.2, work_path).unwrap();
+        assert!(update.is_updating());
+        assert!(update.delete(40, 64, 2).unwrap().is_some());
+        let replacement = vec![40.25, 7.0];
+        update.insert(replacement.clone(), 128).unwrap();
+        drop(static_index);
+
+        let (committed, id_map) = update.commit_updates_to_static(static_path).unwrap();
+        assert_eq!(id_map.len(), 220);
+        assert!(!committed.is_updating());
+        assert_eq!(committed.num_vectors, 200);
+        assert_eq!(committed.search(&replacement, 1, 128).len(), 1);
+        drop(committed);
+
+        let reopened = DiskANN::<f32, DistL2>::open_index_with(static_path, DistL2).unwrap();
+        assert!(!reopened.is_updating());
+        assert_eq!(reopened.num_vectors, 200);
+        assert_eq!(reopened.search(&replacement, 1, 128).len(), 1);
+        let _ = fs::remove_file(static_path);
+        let _ = fs::remove_file(work_path);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "rust-diskann"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Jianshu Zhao <jianshuzhao@yahoo.com>"]
 repository = "https://github.com/jianshu93/rust-diskann"
@@ -40,4 +40,3 @@ hdf5 = { package = "hdf5-metno", version = "0.10", features = ["static", "zlib"]
 cpu-time = "1.0.0"
 byteorder = "1.5.0"
 hnsw_rs = {version = "0.3.3", default-features = false, features = ["stdsimd"]}
-heed = { version = "0.22.0", default-features = false }

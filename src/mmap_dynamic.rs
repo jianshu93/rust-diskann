@@ -1,21 +1,20 @@
 //! Fixed-layout, mmap-backed dynamic DiskANN with MERIT deletion repair.
 
-use super::{DiskANN, DiskAnnError, PAD_U32};
+use super::{Candidate, DiskANN, DiskAnnError, PAD_U32, graph_search};
 use anndists::prelude::Distance;
 use memmap2::{MmapMut, MmapOptions};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DATA_OFFSET: u64 = 1024 * 1024;
 const MAGIC: [u8; 8] = *b"DYNANN01";
 
 #[derive(Clone, Serialize, Deserialize)]
-struct DynamicMetadata {
+pub(crate) struct DynamicMetadata {
     magic: [u8; 8],
     dim: usize,
     capacity: usize,
@@ -29,25 +28,6 @@ struct DynamicMetadata {
     valid_offset: u64,
     elem_size: u8,
     distance_name: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Candidate {
-    id: u32,
-    dist: f32,
-}
-impl Eq for Candidate {}
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for Candidate {
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.dist
-            .total_cmp(&o.dist)
-            .then_with(|| self.id.cmp(&o.id))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,13 +48,14 @@ struct DeletePlan {
 
 /// A fixed-capacity dynamic index. Vector and `u32` adjacency regions have the
 /// same row-major mmap layout as `DiskANN`; version and validity arrays follow.
-pub struct MmapDynamicDiskANN<T, D>
+pub(crate) struct MmapDynamicDiskANN<T, D>
 where
     T: bytemuck::Pod + Copy + Send + Sync + 'static,
     D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
     meta: DynamicMetadata,
     mmap: MmapMut,
+    work_path: PathBuf,
     dist: D,
     _marker: PhantomData<T>,
 }
@@ -103,6 +84,7 @@ where
             edge_versions_offset + capacity as u64 * index.max_degree as u64 * 2;
         let valid_offset = node_versions_offset + capacity as u64 * 2;
         let file_len = valid_offset + capacity as u64;
+        let work_path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -129,6 +111,7 @@ where
         let mut out = Self {
             meta,
             mmap,
+            work_path,
             dist: index.dist,
             _marker: PhantomData,
         };
@@ -151,26 +134,20 @@ where
         Ok(out)
     }
 
-    pub fn open(path: impl AsRef<Path>, dist: D) -> Result<Self, DiskAnnError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-        let meta: DynamicMetadata = bincode::deserialize(&mmap[8..8 + len])?;
-        if meta.magic != MAGIC || meta.elem_size != std::mem::size_of::<T>() as u8 {
-            return Err(DiskAnnError::IndexError(
-                "invalid dynamic mmap format or element type".into(),
-            ));
-        }
-        Ok(Self {
-            meta,
-            mmap,
-            dist,
-            _marker: PhantomData,
-        })
-    }
-
     pub fn capacity(&self) -> usize {
         self.meta.capacity
+    }
+    pub(crate) fn dim(&self) -> usize {
+        self.meta.dim
+    }
+    pub(crate) fn max_degree(&self) -> usize {
+        self.meta.max_degree
+    }
+    pub(crate) fn medoid_id(&self) -> u32 {
+        self.meta.medoid_id
+    }
+    pub(crate) fn distance_name(&self) -> &str {
+        &self.meta.distance_name
     }
     pub fn len(&self) -> usize {
         (0..self.meta.capacity)
@@ -189,12 +166,52 @@ where
         Ok(())
     }
 
-    pub fn search(&self, query: &[T], k: usize, beam: usize) -> Vec<u32> {
+    pub(crate) fn search_with_dists(&self, query: &[T], k: usize, beam: usize) -> Vec<(u32, f32)> {
         self.search_pool(query, beam)
             .into_iter()
             .take(k)
-            .map(|x| x.id)
+            .map(|x| (x.id, x.dist))
             .collect()
+    }
+
+    pub(crate) fn get_vector(&self, id: usize) -> Vec<T> {
+        self.vector(id as u32).to_vec()
+    }
+
+    pub(crate) fn static_snapshot(&self) -> (Vec<Vec<T>>, Vec<Vec<u32>>, u32, Vec<Option<u32>>) {
+        let live = (0..self.meta.capacity)
+            .map(|id| id as u32)
+            .filter(|id| self.is_valid(*id))
+            .collect::<Vec<_>>();
+        let mut remap = vec![PAD_U32; self.meta.capacity];
+        for (new_id, old_id) in live.iter().enumerate() {
+            remap[*old_id as usize] = new_id as u32;
+        }
+        let vectors = live
+            .iter()
+            .map(|id| self.vector(*id).to_vec())
+            .collect::<Vec<_>>();
+        let graph = live
+            .iter()
+            .map(|id| {
+                self.live_neighbors(*id)
+                    .into_iter()
+                    .filter_map(|old| {
+                        let new = remap[old as usize];
+                        (new != PAD_U32).then_some(new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let id_map = remap
+            .iter()
+            .map(|id| (*id != PAD_U32).then_some(*id))
+            .collect();
+        (vectors, graph, remap[self.meta.medoid_id as usize], id_map)
+    }
+
+    pub(crate) fn work_path(&self) -> &Path {
+        &self.work_path
     }
 
     pub fn insert(&mut self, vector: Vec<T>, beam: usize) -> Result<u32, DiskAnnError> {
@@ -245,17 +262,6 @@ where
             }
         }
         Ok(slots)
-    }
-
-    pub fn delete(
-        &mut self,
-        id: u32,
-        repair_beam: usize,
-        repair_degree: usize,
-    ) -> Option<DeleteStats> {
-        self.delete_batch(&[id], repair_beam, repair_degree)
-            .into_iter()
-            .next()
     }
 
     /// MERIT batch deletion: invalidate together, build repair plans in parallel,
@@ -476,40 +482,12 @@ where
         if self.is_empty() || !self.is_valid(self.meta.medoid_id) {
             return Vec::new();
         }
-        let beam = beam.max(1);
-        let start = Candidate {
-            id: self.meta.medoid_id,
-            dist: self.dist.eval(query, self.vector(self.meta.medoid_id)),
-        };
-        let mut visited = HashSet::from([start.id]);
-        let mut frontier = BinaryHeap::from([Reverse(start)]);
-        let mut work = BinaryHeap::from([start]);
-        while let Some(Reverse(best)) = frontier.peek().copied() {
-            if work.len() >= beam && best.dist >= work.peek().unwrap().dist {
-                break;
-            }
-            let Reverse(cur) = frontier.pop().unwrap();
-            for nb in self.live_neighbors(cur.id) {
-                if !visited.insert(nb) {
-                    continue;
-                }
-                let c = Candidate {
-                    id: nb,
-                    dist: self.dist.eval(query, self.vector(nb)),
-                };
-                if work.len() < beam {
-                    work.push(c);
-                    frontier.push(Reverse(c));
-                } else if c.dist < work.peek().unwrap().dist {
-                    work.pop();
-                    work.push(c);
-                    frontier.push(Reverse(c));
-                }
-            }
-        }
-        let mut out = work.into_vec();
-        out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
-        out
+        graph_search(
+            self.meta.medoid_id,
+            beam,
+            |id| self.dist.eval(query, self.vector(id)),
+            |id| self.live_neighbors(id),
+        )
     }
     fn prune(&self, source: u32, ids: &[u32]) -> Vec<u32> {
         let sv = self.vector(source);
@@ -657,7 +635,11 @@ mod tests {
         let ids = (20..60).collect::<Vec<_>>();
         assert_eq!(d.delete_batch(&ids, 128, 2).len(), 40);
         for id in &ids {
-            assert!(!d.search(&vectors[*id as usize], 20, 128).contains(id));
+            assert!(
+                !d.search_with_dists(&vectors[*id as usize], 20, 128)
+                    .iter()
+                    .any(|result| result.0 == *id)
+            );
         }
         let replacements = ids
             .iter()
@@ -666,11 +648,9 @@ mod tests {
         let reused = d.insert_batch(replacements, 128).unwrap();
         assert_eq!(reused.len(), 40);
         d.flush().unwrap();
-        drop(d);
-        let reopened = MmapDynamicDiskANN::<f32, DistL2>::open(dynp, DistL2).unwrap();
-        assert_eq!(reopened.len(), 400);
+        assert_eq!(d.len(), 400);
         for id in reused {
-            assert_eq!(reopened.search(&vectors[id as usize], 1, 128), vec![id]);
+            assert_eq!(d.search_with_dists(&vectors[id as usize], 1, 128)[0].0, id);
         }
         let _ = fs::remove_file(base);
         let _ = fs::remove_file(dynp);
