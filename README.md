@@ -168,7 +168,7 @@ let results: Vec<Vec<u32>> = query_batch
 
 ### Insert And Delete Transaction
 
-The static file format and search API remain unchanged. `begin_updates` creates a temporary workspace with a fixed capacity. `commit_updates_to_static` filters stale edges, compacts live IDs, atomically replaces the destination, removes the workspace, and returns a normal static `DiskANN` handle.
+The static file format and search API remain unchanged. `begin_updates` creates a temporary workspace with a fixed capacity. The normal and required successful completion path is `commit_updates_to_static`: it filters stale edges, compacts live IDs, atomically replaces the destination, removes the workspace, and returns a normal static `DiskANN` plus its ID mapping. The temporary workspace is an implementation detail and is not a persistent searchable index.
 
 ```rust
 use anndists::dist::DistL2;
@@ -196,7 +196,7 @@ let stats = update.delete_batch(&ids_to_delete, 2 * 48, 2)?;
 
 drop(static_index);
 let (index, old_to_new_id) = update.commit_updates_to_static("static.db")?;
-// `index` is now an ordinary static index; no version state is needed to search.
+// `index` is an ordinary static index; no version state is needed to search.
 // `old_to_new_id[old_slot]` records ID compaction; deleted slots map to `None`.
 ```
 
@@ -420,7 +420,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 Jayaram Subramanya, S., Devvrit, F., Simhadri, H.V., Krishnawamy, R. and Kadekodi, R., 2019. Diskann: Fast accurate billion-point nearest neighbor search on a single node. Advances in neural information processing Systems, 32.
 
 Zekai Wu, Jiabao Jin, Peng Cheng, Wangze Ni, Haoyang Li, Lei Chen, Junjie Yao, Jingkuan Song, and Heng Tao Shen. 2026. MERIT: Efficient In-Place Deletion for Dynamic Graph-Based Approximate Nearest Neighbor Indexes. [arXiv:2607.29173](https://arxiv.org/abs/2607.29173).
-
-## Acknowledgments
-
-This implementation is based on the DiskANN paper and the official Microsoft implementation. It was also largely inspired by the implementation [here](https://github.com/lukaesch/diskann-rs).

@@ -651,11 +651,11 @@ where
         Ok(())
     }
 
-    /// Commits a dynamic update session as a legacy static-v1 index.
+    /// Finishes an update session and commits it as an ordinary static index.
     ///
     /// Only live vectors and live, version-matching edges are written. IDs are
-    /// compacted to `0..num_vectors`; the returned handle uses the ordinary
-    /// static search format and contains no validity or version arrays.
+    /// compacted to `0..num_vectors`; the returned tuple contains the ordinary
+    /// static search index and the required old-to-new ID mapping.
     pub fn commit_updates_to_static(
         self,
         path: &str,
