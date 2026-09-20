@@ -256,6 +256,10 @@ cargo run --release --example merit_fashion_rebuild_baselines -- \
 # test SIFT dataset
 wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
 cargo run --release --example diskann_sift
+
+# SIFT1M: delete 0.1%, commit a static index, and compare recall/time/QPS
+# with a fresh static rebuild. The HDF5 file defaults to the repository root.
+cargo run --release --example merit_sift1m_delete
 ```
 
 ### Fashion-MNIST Transaction Results
@@ -290,6 +294,7 @@ See the `examples/` directory for:
 - `perf_test.rs`: Performance benchmarking with 1M vectors
 - `diskann_mnist.rs`: Performance benchmarking with MNIST fashion dataset (60K)
 - `diskann_sift.rs`: Performance benchmarking with SIFT 1M dataset
+- `merit_sift1m_delete.rs`: SIFT1M 0.1% MERIT deletion versus fresh rebuild
 - `bigann.rs`: Performance benchmarking with SIFT 10M dataset
 - `hnsw_sift.rs`: Comparison with in-memory HNSW
 
