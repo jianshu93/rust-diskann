@@ -1491,9 +1491,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::{DistCosine, DistJaccard, DistL2};
+    use anndists::dist::{DistCosine, DistJaccard, DistL1, DistL2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
-    use std::fs;
+    use std::{fs, time::Instant};
 
     fn euclid(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
@@ -1532,6 +1532,114 @@ mod tests {
                 .count();
         }
         hits as f32 / (queries.len() * k) as f32
+    }
+
+    fn exact_recall_mapped<T, D>(
+        index: &DiskANN<T, D>,
+        internal_to_original: &[u32],
+        vectors: &[Vec<T>],
+        active: &[bool],
+        queries: &[Vec<T>],
+        dist: D,
+    ) -> f32
+    where
+        T: bytemuck::Pod + Copy + Send + Sync + 'static,
+        D: Distance<T> + Send + Sync + Copy + Clone + 'static,
+    {
+        let mut hits = 0usize;
+        for query in queries {
+            let mut truth = vectors
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| active[*id])
+                .map(|(id, vector)| (id as u32, dist.eval(query, vector)))
+                .collect::<Vec<_>>();
+            truth.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth = truth
+                .into_iter()
+                .take(10)
+                .map(|item| item.0)
+                .collect::<HashSet<_>>();
+            hits += index
+                .search(query, 10, 256)
+                .into_iter()
+                .filter(|id| truth.contains(&internal_to_original[*id as usize]))
+                .count();
+        }
+        hits as f32 / (queries.len() * 10) as f32
+    }
+
+    fn merit_clustered_delete<T, D>(
+        vectors: &[Vec<T>],
+        queries: &[Vec<T>],
+        dist: D,
+        tag: &str,
+    ) -> (f32, f32, f64, f64)
+    where
+        T: bytemuck::Pod + Copy + Send + Sync + 'static,
+        D: Distance<T> + Send + Sync + Copy + Clone + 'static,
+    {
+        let static_path = format!("test_{tag}_static.db");
+        let work_path = format!("test_{tag}.work");
+        let rebuilt_path = format!("test_{tag}_rebuilt.db");
+        for path in [&static_path, &work_path, &rebuilt_path] {
+            let _ = fs::remove_file(path);
+        }
+        let mut active = vec![true; vectors.len()];
+        let deleted = (0..vectors.len())
+            .step_by(100)
+            .map(|id| id as u32)
+            .collect::<Vec<_>>();
+        for id in &deleted {
+            active[*id as usize] = false;
+        }
+
+        let initial =
+            DiskANN::build_index_with_params(vectors, dist, &static_path, quality_params())
+                .unwrap();
+        let started = Instant::now();
+        let mut update = initial
+            .begin_updates(vectors.len(), 1.2, &work_path)
+            .unwrap();
+        update.delete_batch(&deleted).unwrap();
+        let (committed, old_to_new) = update.commit_updates_to_static(&static_path).unwrap();
+        let update_seconds = started.elapsed().as_secs_f64();
+        let mut committed_map = vec![u32::MAX; committed.num_vectors];
+        for (old, new) in old_to_new.into_iter().enumerate() {
+            if let Some(new) = new {
+                committed_map[new as usize] = old as u32;
+            }
+        }
+
+        let surviving_ids = active
+            .iter()
+            .enumerate()
+            .filter_map(|(id, live)| live.then_some(id as u32))
+            .collect::<Vec<_>>();
+        let surviving = surviving_ids
+            .iter()
+            .map(|id| vectors[*id as usize].clone())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let rebuilt =
+            DiskANN::build_index_with_params(&surviving, dist, &rebuilt_path, quality_params())
+                .unwrap();
+        let rebuild_seconds = started.elapsed().as_secs_f64();
+        let committed_recall =
+            exact_recall_mapped(&committed, &committed_map, vectors, &active, queries, dist);
+        let rebuilt_recall =
+            exact_recall_mapped(&rebuilt, &surviving_ids, vectors, &active, queries, dist);
+        drop(committed);
+        drop(rebuilt);
+        for path in [&static_path, &work_path, &rebuilt_path] {
+            let _ = fs::remove_file(path);
+        }
+        (
+            committed_recall,
+            rebuilt_recall,
+            update_seconds,
+            rebuild_seconds,
+        )
     }
 
     fn quality_params() -> DiskAnnParams {
@@ -1833,5 +1941,89 @@ mod tests {
         let recall = exact_recall(&index, &vectors, &queries, DistJaccard, 10, 256);
         assert!(recall >= 0.95, "Jaccard recall was {recall}");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_merit_clustered_l1_delete() {
+        let mut rng = StdRng::seed_from_u64(81);
+        let mut vectors = Vec::with_capacity(10_000);
+        let mut queries = Vec::with_capacity(100);
+        for cluster in 0..50 {
+            let center = (0..32)
+                .map(|dim| (((cluster * 37 + dim * 13) % 101) as f32 - 50.0) * 8.0)
+                .collect::<Vec<_>>();
+            for _ in 0..200 {
+                vectors.push(
+                    center
+                        .iter()
+                        .map(|value| value + rng.gen_range(-0.15f32..0.15))
+                        .collect(),
+                );
+            }
+            for _ in 0..2 {
+                queries.push(
+                    center
+                        .iter()
+                        .map(|value| value + rng.gen_range(-0.15f32..0.15))
+                        .collect(),
+                );
+            }
+        }
+        let (updated, rebuilt, update_s, rebuild_s) =
+            merit_clustered_delete(&vectors, &queries, DistL1, "merit_clustered_l1");
+        println!(
+            "clustered L1 MERIT: updated={updated:.6}, rebuilt={rebuilt:.6}, delta={:.6}, update={update_s:.3}s, rebuild={rebuild_s:.3}s",
+            updated - rebuilt
+        );
+        assert!(updated >= 0.95, "clustered L1 MERIT recall was {updated}");
+        assert!(
+            updated + 0.02 >= rebuilt,
+            "clustered L1 delta was {}",
+            updated - rebuilt
+        );
+    }
+
+    #[test]
+    fn test_merit_clustered_jaccard_delete() {
+        let mut rng = StdRng::seed_from_u64(82);
+        let mut vectors = Vec::with_capacity(10_000);
+        let mut queries = Vec::with_capacity(100);
+        for cluster in 0..50 {
+            let mut center = vec![1u32; 64];
+            for marker in 0..8 {
+                center[(cluster * 11 + marker * 7) % 64] = 30 + (cluster % 7) as u32;
+            }
+            for _ in 0..200 {
+                vectors.push(
+                    center
+                        .iter()
+                        .map(|value| value + rng.gen_range(0u32..3))
+                        .collect(),
+                );
+            }
+            for _ in 0..2 {
+                queries.push(
+                    center
+                        .iter()
+                        .map(|value| value + rng.gen_range(0u32..3))
+                        .collect(),
+                );
+            }
+        }
+        let (updated, rebuilt, update_s, rebuild_s) =
+            merit_clustered_delete(&vectors, &queries, DistJaccard, "merit_clustered_jaccard");
+        println!(
+            "clustered Jaccard MERIT: updated={updated:.6}, rebuilt={rebuilt:.6}, delta={:.6}, update={update_s:.3}s, rebuild={rebuild_s:.3}s",
+            updated - rebuilt
+        );
+        assert!(
+            updated >= 0.95,
+            "clustered Jaccard MERIT recall was {updated}"
+        );
+        assert!(
+            updated + 0.02 >= rebuilt,
+            "clustered Jaccard delta was {}",
+            updated - rebuilt
+        );
     }
 }
