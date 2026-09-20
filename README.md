@@ -271,9 +271,23 @@ cargo run --release --example hnsw_sift
 
 ```
 
-Results:
+## Results
+
+### SIFT1M Server Run
+
+The following results were measured on the same 1,000,000-vector SIFT dataset with 10,000 queries and strict Recall@10. The search parameters are the tested operating points, not matched-latency settings: DiskANN used search beam 512, while HNSW used `ef_search=64`.
+
+| Index | Build parameters | Search parameter | Build CPU time | Build wall time | Recall@10 | Queries/s |
+|---|---|---:|---:|---:|---:|---:|
+| DiskANN | `R=64`, `L=128`, `alpha=1.2`, `extra_seeds=1` | beam 512 | 21,080.34 s | 204.10 s | **0.99999** | 14,211.89 |
+| HNSW (`hnsw_rs`) | 16 layers, `ef_construction=256` | `ef_search=64` | 8,654.87 s | not reported | 0.98765 | **48,650.67** |
+
+DiskANN returned all requested neighbors, with a mean last-distance ratio of `1.0000006`. HNSW also returned all requested neighbors, with a mean last-distance ratio of `1.0003949`. CPU time can substantially exceed wall time during parallel construction because it is accumulated across worker threads.
+
+### SIFT1M M4 Max Run
+
 ```bash
-## DiskANN,  sift1m , M4 Max
+# DiskANN, SIFT1M, M4 Max
 DiskANN benchmark on "./sift-128-euclidean.hdf5"
 neighbours shape : [10000, 100]
 
