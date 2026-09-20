@@ -29,6 +29,8 @@ Dynamic deletion follows the MERIT algorithm:
 
 For batch deletion, repair plans declare their candidate-node write sets. Plans with no overlapping writes run in parallel within the same dependency wave. Conflicting plans run in ordered waves, preventing lost adjacency updates without unsafe concurrent mmap writes.
 
+The `k_r`-MST repair caches one symmetric distance matrix per local candidate set. Prim selection and parent ranking therefore compute each candidate-pair distance once instead of repeatedly scanning the original vectors.
+
 ### Transient Update Layout
 
 The temporary update workspace keeps fixed-offset regions in one file:

@@ -552,46 +552,62 @@ where
         if candidates.is_empty() {
             return (HashMap::new(), 0);
         }
+        // Prim selection and parent ranking revisit the same candidate pairs.
+        // Compute each high-dimensional distance once and keep the small local
+        // matrix hot in cache for the remainder of this repair plan.
+        let count = candidates.len();
+        let mut pair_distances = vec![0.0f32; count * count];
+        for left in 0..count {
+            for right in (left + 1)..count {
+                let distance = self.dist.eval(
+                    self.vector(candidates[left]),
+                    self.vector(candidates[right]),
+                );
+                pair_distances[left * count + right] = distance;
+                pair_distances[right * count + left] = distance;
+            }
+        }
         let entry = self.vector(self.meta.medoid_id);
-        let start = *candidates
+        let start = candidates
             .iter()
+            .enumerate()
             .min_by(|a, b| {
                 self.dist
-                    .eval(self.vector(**a), entry)
-                    .total_cmp(&self.dist.eval(self.vector(**b), entry))
+                    .eval(self.vector(*a.1), entry)
+                    .total_cmp(&self.dist.eval(self.vector(*b.1), entry))
             })
+            .map(|(index, _)| index)
             .unwrap();
         let mut connected = vec![start];
-        let mut remaining = candidates
-            .iter()
-            .copied()
-            .filter(|x| *x != start)
+        let mut remaining = (0..count)
+            .filter(|index| *index != start)
             .collect::<Vec<_>>();
         let mut updates = HashMap::<u32, Vec<u32>>::new();
         let mut attempted = 0;
         while !remaining.is_empty() {
-            let (ri, next) = remaining
+            let (ri, next_index) = remaining
                 .iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
                     let da = connected
                         .iter()
-                        .map(|x| self.dist.eval(self.vector(**a), self.vector(*x)))
+                        .map(|x| pair_distances[**a * count + *x])
                         .min_by(f32::total_cmp)
                         .unwrap();
                     let db = connected
                         .iter()
-                        .map(|x| self.dist.eval(self.vector(**b), self.vector(*x)))
+                        .map(|x| pair_distances[**b * count + *x])
                         .min_by(f32::total_cmp)
                         .unwrap();
                     da.total_cmp(&db)
                 })
                 .map(|(i, x)| (i, *x))
                 .unwrap();
+            let next = candidates[next_index];
             let mut parents = connected
                 .iter()
                 .copied()
-                .map(|p| (p, self.dist.eval(self.vector(next), self.vector(p))))
+                .map(|p| (candidates[p], pair_distances[next_index * count + p]))
                 .collect::<Vec<_>>();
             parents.sort_by(|a, b| a.1.total_cmp(&b.1));
             for (parent, _) in parents.into_iter().take(degree) {
@@ -607,7 +623,7 @@ where
                 }
                 attempted += 2;
             }
-            connected.push(next);
+            connected.push(next_index);
             remaining.swap_remove(ri);
         }
         (updates, attempted)
