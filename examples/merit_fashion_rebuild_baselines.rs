@@ -182,9 +182,9 @@ fn run(
         work_map.resize(capacity, None);
         let work_path = format!("{scenario}_{round}.work");
         let started = Instant::now();
-        let mut update = DiskANN::begin_updates(&index, capacity, 1.2, &work_path)?;
+        let mut update = index.begin_updates(capacity, 1.2, &work_path)?;
         if deleting {
-            update.delete_batch(&deleted_slots, 2 * R, 2)?;
+            update.delete_batch(&deleted_slots)?;
             for (slot, orig) in deleted_slots.iter().zip(&deleted_orig) {
                 work_map[*slot as usize] = None;
                 active[*orig as usize] = false;
@@ -201,7 +201,6 @@ fn run(
                 active[*orig as usize] = true;
             }
         }
-        drop(index);
         let (next, old_new) = update.commit_updates_to_static(&index_path)?;
         index = next;
         map = remap(&work_map, &old_new, index.num_vectors);

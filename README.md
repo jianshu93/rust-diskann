@@ -180,8 +180,7 @@ let static_index = DiskANN::<f32, DistL2>::build_index_default(
     "static.db",
 )?;
 
-let mut update = DiskANN::begin_updates(
-    &static_index,
+let mut update = static_index.begin_updates(
     vectors.len() + 10_000,
     1.2,
     "index.update-work",
@@ -191,10 +190,7 @@ let mut update = DiskANN::begin_updates(
 // deterministic conflict ordering.
 let inserted_ids = update.insert_batch(new_vectors, 128)?;
 
-// MERIT defaults: repair beam 2R and k_r = 2.
-let stats = update.delete_batch(&ids_to_delete, 2 * 48, 2)?;
-
-drop(static_index);
+let stats = update.delete_batch(&ids_to_delete)?;
 let (index, old_to_new_id) = update.commit_updates_to_static("static.db")?;
 // `index` is an ordinary static index; no version state is needed to search.
 // `old_to_new_id[old_slot]` records ID compaction; deleted slots map to `None`.

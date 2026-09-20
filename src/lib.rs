@@ -563,19 +563,20 @@ where
     /// Commit it with `commit_updates_to_static`; the work file is not a
     /// persistent index format and is never accepted by `open_index_with`.
     pub fn begin_updates(
-        index: &Self,
+        self,
         capacity: usize,
         alpha: f32,
         path: &str,
     ) -> Result<Self, DiskAnnError> {
-        if index.dynamic.is_some() {
+        if self.dynamic.is_some() {
             return Err(DiskAnnError::IndexError(
                 "source index is already dynamic".into(),
             ));
         }
+        let dist = self.dist;
         let dynamic =
-            mmap_dynamic::MmapDynamicDiskANN::create_from_static(index, capacity, alpha, path)?;
-        Ok(Self::from_dynamic(dynamic, index.dist))
+            mmap_dynamic::MmapDynamicDiskANN::create_from_static(&self, capacity, alpha, path)?;
+        Ok(Self::from_dynamic(dynamic, dist))
     }
 
     /// True while this handle is a transient update session.
@@ -617,18 +618,29 @@ where
     }
 
     /// Deletes one node and repairs its neighborhood with MERIT.
-    pub fn delete(
+    pub fn delete(&mut self, id: u32) -> Result<Option<DeleteStats>, DiskAnnError> {
+        let mut stats = self.delete_batch(&[id])?;
+        Ok(stats.pop())
+    }
+
+    /// Deletes one node with explicitly configured MERIT repair parameters.
+    pub fn delete_with_params(
         &mut self,
         id: u32,
         repair_beam: usize,
         repair_degree: usize,
     ) -> Result<Option<DeleteStats>, DiskAnnError> {
-        let mut stats = self.delete_batch(&[id], repair_beam, repair_degree)?;
+        let mut stats = self.delete_batch_with_params(&[id], repair_beam, repair_degree)?;
         Ok(stats.pop())
     }
 
-    /// Deletes a batch using conflict-aware parallel MERIT repair waves.
-    pub fn delete_batch(
+    /// Deletes a batch with MERIT defaults: repair beam `2R` and `k_r = 2`.
+    pub fn delete_batch(&mut self, ids: &[u32]) -> Result<Vec<DeleteStats>, DiskAnnError> {
+        self.delete_batch_with_params(ids, 2 * self.max_degree, 2)
+    }
+
+    /// Deletes a batch with explicitly configured MERIT repair parameters.
+    pub fn delete_batch_with_params(
         &mut self,
         ids: &[u32],
         repair_beam: usize,
@@ -1566,13 +1578,11 @@ mod tests {
             .map(|id| vec![id as f32, (id % 11) as f32])
             .collect::<Vec<_>>();
         let static_index = DiskANN::build_index_default(&vectors, DistL2, static_path).unwrap();
-        let mut update = DiskANN::begin_updates(&static_index, 220, 1.2, work_path).unwrap();
+        let mut update = static_index.begin_updates(220, 1.2, work_path).unwrap();
         assert!(update.is_updating());
-        assert!(update.delete(40, 64, 2).unwrap().is_some());
+        assert!(update.delete(40).unwrap().is_some());
         let replacement = vec![40.25, 7.0];
         update.insert(replacement.clone(), 128).unwrap();
-        drop(static_index);
-
         let (committed, id_map) = update.commit_updates_to_static(static_path).unwrap();
         assert_eq!(id_map.len(), 220);
         assert!(!committed.is_updating());

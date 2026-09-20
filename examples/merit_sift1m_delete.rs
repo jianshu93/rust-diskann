@@ -107,13 +107,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_build_seconds = started.elapsed().as_secs_f64();
 
     let started = Instant::now();
-    let mut update = DiskANN::begin_updates(&initial, n, 1.2, "sift1m_update.work")?;
+    let mut update = initial.begin_updates(n, 1.2, "sift1m_update.work")?;
     let begin_seconds = started.elapsed().as_secs_f64();
-    drop(initial);
     fs::remove_file("sift1m_before.db")?;
 
     let started = Instant::now();
-    let stats = update.delete_batch(&deleted_ids, 2 * R, 2)?;
+    let stats = update.delete_batch(&deleted_ids)?;
     let delete_seconds = started.elapsed().as_secs_f64();
     assert_eq!(stats.len(), delete_count);
     let recovered: usize = stats.iter().map(|item| item.recovered_in_neighbors).sum();
