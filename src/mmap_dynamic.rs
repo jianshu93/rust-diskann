@@ -533,6 +533,7 @@ where
         let selected = self.prune(source, &ids);
         self.write_neighbors(source, &selected);
     }
+    // See MERIT paper: Wu et.al., 2026. MERIT: Efficient In-Place Deletion for Dynamic Graph-Based Approximate Nearest Neighbor Indexes. arXiv preprint arXiv:2607.29173.
     fn repair_kr_mst_updates(
         &self,
         candidates: &[u32],
