@@ -36,6 +36,7 @@
 //! `vectors_offset` is a fixed 1 MiB gap by default.
 
 use anndists::prelude::Distance;
+use log::{debug, info, warn};
 use memmap2::Mmap;
 use rand::{prelude::*, thread_rng};
 use rayon::prelude::*;
@@ -45,6 +46,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::time::Instant;
 use thiserror::Error;
 
 mod mmap_dynamic;
@@ -511,6 +513,8 @@ where
 
     /// Opens an existing index file, supplying the distance strategy explicitly.
     pub fn open_index_with(path: &str, dist: D) -> Result<Self, DiskAnnError> {
+        let started = Instant::now();
+        debug!("opening static DiskANN index path={path}");
         let mut file = OpenOptions::new().read(true).write(false).open(path)?;
 
         // Read metadata length
@@ -538,11 +542,22 @@ where
         // Optional sanity/logging: warn if type differs from recorded name
         let expected = std::any::type_name::<D>();
         if metadata.distance_name != expected {
-            eprintln!(
-                "Warning: index recorded distance `{}` but you opened with `{}`",
+            warn!(
+                "index distance mismatch: recorded={} requested={}",
                 metadata.distance_name, expected
             );
         }
+
+        info!(
+            "opened static DiskANN index path={} vectors={} dim={} max_degree={} medoid={} distance={} elapsed_ms={}",
+            path,
+            metadata.num_vectors,
+            metadata.dim,
+            metadata.max_degree,
+            metadata.medoid_id,
+            metadata.distance_name,
+            started.elapsed().as_millis()
+        );
 
         Ok(Self {
             dim: metadata.dim,
@@ -573,9 +588,19 @@ where
                 "source index is already dynamic".into(),
             ));
         }
+        let started = Instant::now();
+        info!(
+            "starting dynamic update session source_vectors={} dim={} max_degree={} capacity={} alpha={} work_path={}",
+            self.num_vectors, self.dim, self.max_degree, capacity, alpha, path
+        );
         let dist = self.dist;
         let dynamic =
             mmap_dynamic::MmapDynamicDiskANN::create_from_static(&self, capacity, alpha, path)?;
+        info!(
+            "dynamic update session ready work_path={} elapsed_ms={}",
+            path,
+            started.elapsed().as_millis()
+        );
         Ok(Self::from_dynamic(dynamic, dist))
     }
 
@@ -608,12 +633,21 @@ where
         vectors: Vec<Vec<T>>,
         beam: usize,
     ) -> Result<Vec<u32>, DiskAnnError> {
+        let count = vectors.len();
+        let started = Instant::now();
+        info!("inserting batch count={} beam={}", count, beam);
         let dynamic = self
             .dynamic
             .as_mut()
             .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
         let ids = dynamic.insert_batch(vectors, beam)?;
         self.num_vectors = dynamic.len();
+        info!(
+            "insert batch complete inserted={} live_vectors={} elapsed_ms={}",
+            ids.len(),
+            self.num_vectors,
+            started.elapsed().as_millis()
+        );
         Ok(ids)
     }
 
@@ -646,12 +680,31 @@ where
         repair_beam: usize,
         repair_degree: usize,
     ) -> Result<Vec<DeleteStats>, DiskAnnError> {
+        let started = Instant::now();
+        info!(
+            "deleting batch requested={} repair_beam={} repair_degree={}",
+            ids.len(),
+            repair_beam,
+            repair_degree
+        );
         let dynamic = self
             .dynamic
             .as_mut()
             .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
         let stats = dynamic.delete_batch(ids, repair_beam, repair_degree);
         self.num_vectors = dynamic.len();
+        let recovered: usize = stats.iter().map(|s| s.recovered_in_neighbors).sum();
+        let candidates: usize = stats.iter().map(|s| s.repair_candidates).sum();
+        let attempted: usize = stats.iter().map(|s| s.repair_edges_attempted).sum();
+        info!(
+            "delete batch complete deleted={} live_vectors={} recovered_in_neighbors={} repair_candidates={} repair_edges_attempted={} elapsed_ms={}",
+            stats.len(),
+            self.num_vectors,
+            recovered,
+            candidates,
+            attempted,
+            started.elapsed().as_millis()
+        );
         Ok(stats)
     }
 
@@ -672,6 +725,7 @@ where
         self,
         path: &str,
     ) -> Result<(Self, Vec<Option<u32>>), DiskAnnError> {
+        let started = Instant::now();
         let dynamic = self.dynamic.as_ref().ok_or_else(|| {
             DiskAnnError::IndexError("commit requires a dynamic update session".into())
         })?;
@@ -683,6 +737,13 @@ where
             ));
         }
         let temporary = format!("{path}.static-commit-{}", std::process::id());
+        info!(
+            "committing update session to static index path={} live_vectors={} max_degree={} temporary={}",
+            path,
+            live.len(),
+            self.max_degree,
+            temporary
+        );
         let dist = self.dist;
         let result = write_static_graph_streaming(
             dynamic,
@@ -699,7 +760,14 @@ where
         if work_path != std::path::Path::new(path) {
             let _ = std::fs::remove_file(work_path);
         }
-        Ok((Self::open_index_with(path, dist)?, id_map))
+        let index = Self::open_index_with(path, dist)?;
+        info!(
+            "static commit complete path={} vectors={} elapsed_ms={}",
+            path,
+            index.num_vectors,
+            started.elapsed().as_millis()
+        );
+        Ok((index, id_map))
     }
 }
 
@@ -716,6 +784,7 @@ where
     T: bytemuck::Pod + Copy + Send + Sync + 'static,
     D: Distance<T> + Send + Sync + Copy + Clone + 'static,
 {
+    let started = Instant::now();
     let dim = dynamic.dim();
     let vectors_offset = 1024 * 1024u64;
     let adjacency_offset = vectors_offset + (live.len() * dim * std::mem::size_of::<T>()) as u64;
@@ -758,6 +827,14 @@ where
     file.write_all(&(bytes.len() as u64).to_le_bytes())?;
     file.write_all(&bytes)?;
     file.sync_all()?;
+    debug!(
+        "streamed static index path={} vectors={} dim={} max_degree={} elapsed_ms={}",
+        path,
+        live.len(),
+        dim,
+        max_degree,
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -805,10 +882,22 @@ where
         dist: D,
         file_path: &str,
     ) -> Result<Self, DiskAnnError> {
+        let started = Instant::now();
         let flat = FlatVectors::from_vecs(vectors)?;
 
         let num_vectors = flat.n;
         let dim = flat.dim;
+        info!(
+            "building DiskANN index path={} vectors={} dim={} max_degree={} build_beam={} alpha={} extra_seeds={} distance={}",
+            file_path,
+            num_vectors,
+            dim,
+            max_degree,
+            build_beam_width,
+            alpha,
+            extra_seeds,
+            std::any::type_name::<D>()
+        );
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -834,6 +923,7 @@ where
 
         // Compute medoid using flat storage
         let medoid_id = calculate_medoid(&flat, dist);
+        debug!("selected medoid id={medoid_id}");
 
         // Build graph
         let adjacency_offset = vectors_offset as u64 + total_vector_bytes;
@@ -878,7 +968,7 @@ where
         // Memory map the file
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        Ok(Self {
+        let index = Self {
             dim,
             num_vectors,
             max_degree,
@@ -890,7 +980,17 @@ where
             dynamic: None,
             dist,
             _phantom: PhantomData,
-        })
+        };
+        info!(
+            "DiskANN build complete path={} vectors={} dim={} max_degree={} medoid={} elapsed_ms={}",
+            file_path,
+            num_vectors,
+            dim,
+            max_degree,
+            medoid_id,
+            started.elapsed().as_millis()
+        );
+        Ok(index)
     }
 
     /// Searches the index for nearest neighbors using a best-first beam search.

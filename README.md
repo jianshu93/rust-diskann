@@ -225,6 +225,10 @@ When host RAM is not large enough for mapping the entire database file, it is po
 
 ## Building and Testing
 
+### Logging
+
+The library emits only key lifecycle events through the `log` facade and does not install a logger. Applications can initialize any compatible logger and use `RUST_LOG=info` for build/update/commit events or `RUST_LOG=debug` for MERIT repair summaries. Logging remains disabled by default.
+
 ```bash
 # Build the library
 cargo build --release

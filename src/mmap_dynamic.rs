@@ -2,6 +2,7 @@
 
 use super::{Candidate, DiskANN, DiskAnnError, PAD_U32, graph_search};
 use anndists::prelude::Distance;
+use log::debug;
 use memmap2::{MmapMut, MmapOptions};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const DATA_OFFSET: u64 = 1024 * 1024;
 const MAGIC: [u8; 8] = *b"DYNANN01";
@@ -71,6 +73,7 @@ where
         alpha: f32,
         path: impl AsRef<Path>,
     ) -> Result<Self, DiskAnnError> {
+        let started = Instant::now();
         if capacity < index.num_vectors {
             return Err(DiskAnnError::IndexError(
                 "dynamic capacity is smaller than source index".into(),
@@ -131,6 +134,14 @@ where
             out.write_neighbors(id as u32, &neighbors);
         }
         out.flush()?;
+        debug!(
+            "dynamic workspace initialized path={} source_vectors={} capacity={} bytes={} elapsed_ms={}",
+            out.work_path.display(),
+            index.num_vectors,
+            capacity,
+            file_len,
+            started.elapsed().as_millis()
+        );
         Ok(out)
     }
 
@@ -214,6 +225,7 @@ where
         vectors: Vec<Vec<T>>,
         beam: usize,
     ) -> Result<Vec<u32>, DiskAnnError> {
+        let started = Instant::now();
         if vectors.iter().any(|v| v.len() != self.meta.dim) {
             return Err(DiskAnnError::IndexError(
                 "insert vector dimension mismatch".into(),
@@ -250,6 +262,12 @@ where
                 self.insert_and_prune(target, id);
             }
         }
+        debug!(
+            "dynamic insert planned_and_committed={} beam={} elapsed_ms={}",
+            slots.len(),
+            beam,
+            started.elapsed().as_millis()
+        );
         Ok(slots)
     }
 
@@ -261,6 +279,7 @@ where
         repair_beam: usize,
         repair_degree: usize,
     ) -> Vec<DeleteStats> {
+        let started = Instant::now();
         let plans = self.prepare_delete_plans(ids, repair_beam);
         if plans.is_empty() {
             return Vec::new();
@@ -283,6 +302,13 @@ where
             }
         }
 
+        debug!(
+            "MERIT repair planned deletes={} conflict_waves={} repair_beam={} repair_degree={}",
+            plans.len(),
+            waves.len(),
+            repair_beam,
+            repair_degree
+        );
         let mut attempted = vec![0usize; plans.len()];
         for wave in waves {
             let results = wave
@@ -302,7 +328,7 @@ where
             }
         }
 
-        plans
+        let stats = plans
             .into_iter()
             .enumerate()
             .map(|(index, mut plan)| {
@@ -310,7 +336,13 @@ where
                 self.finish_delete_plan(&plan);
                 plan.stats
             })
-            .collect()
+            .collect::<Vec<_>>();
+        debug!(
+            "MERIT repair committed deletes={} elapsed_ms={}",
+            stats.len(),
+            started.elapsed().as_millis()
+        );
+        stats
     }
 
     fn prepare_delete_plans(&mut self, ids: &[u32], repair_beam: usize) -> Vec<DeletePlan> {
