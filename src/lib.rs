@@ -50,7 +50,10 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod mmap_dynamic;
-pub use mmap_dynamic::DeleteStats;
+pub use mmap_dynamic::{
+    DeleteStats, GuardedDeleteResult, RoutabilityAdmissionReport, RoutabilityGuardConfig,
+    RoutabilityGuardStatus,
+};
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
 const PAD_U32: u32 = u32::MAX;
@@ -609,6 +612,55 @@ where
         self.dynamic.is_some()
     }
 
+    /// Enables the optional in-memory routability guard for this update session.
+    ///
+    /// The guard is disabled by default and is discarded when the session is
+    /// committed to a static index. It does not change the static file format.
+    pub fn enable_routability_guard(
+        &mut self,
+        config: RoutabilityGuardConfig,
+    ) -> Result<RoutabilityGuardStatus, DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_mut()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        dynamic.enable_routability_guard(config)
+    }
+
+    /// Disables the optional in-memory routability guard for this update session.
+    pub fn disable_routability_guard(&mut self) -> Result<(), DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_mut()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        dynamic.disable_routability_guard();
+        Ok(())
+    }
+
+    /// Returns the current optional routability-guard state.
+    pub fn routability_guard_status(&self) -> Result<RoutabilityGuardStatus, DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_ref()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        Ok(dynamic.routability_guard_status())
+    }
+
+    /// Runs a virtual routability preflight for a proposed delete batch.
+    ///
+    /// Call [`Self::enable_routability_guard`] once before using this method.
+    /// The preflight does not mutate the update session.
+    pub fn assess_delete_admission(
+        &self,
+        ids: &[u32],
+    ) -> Result<RoutabilityAdmissionReport, DiskAnnError> {
+        let dynamic = self
+            .dynamic
+            .as_ref()
+            .ok_or_else(|| DiskAnnError::IndexError("begin_updates must be called first".into()))?;
+        dynamic.assess_delete_admission(ids)
+    }
+
     /// Number of addressable slots. Static-v1 capacity equals its vector count.
     pub fn capacity(&self) -> usize {
         self.dynamic
@@ -706,6 +758,59 @@ where
             started.elapsed().as_millis()
         );
         Ok(stats)
+    }
+
+    /// Deletes a batch only when the optional routability preflight admits it.
+    ///
+    /// This uses the standard MERIT defaults: repair beam `2R` and `k_r = 2`.
+    /// Enable the guard first with [`Self::enable_routability_guard`]. A
+    /// deferred result leaves the update session entirely unchanged.
+    pub fn delete_batch_with_admission_control(
+        &mut self,
+        ids: &[u32],
+    ) -> Result<GuardedDeleteResult, DiskAnnError> {
+        self.delete_batch_with_admission_control_with_params(ids, 2 * self.max_degree, 2)
+    }
+
+    /// Deletes a batch only when the optional routability preflight admits it,
+    /// with explicitly configured MERIT repair parameters.
+    pub fn delete_batch_with_admission_control_with_params(
+        &mut self,
+        ids: &[u32],
+        repair_beam: usize,
+        repair_degree: usize,
+    ) -> Result<GuardedDeleteResult, DiskAnnError> {
+        let started = Instant::now();
+        let (result, live_vectors) = {
+            let dynamic = self.dynamic.as_mut().ok_or_else(|| {
+                DiskAnnError::IndexError("begin_updates must be called first".into())
+            })?;
+            let result =
+                dynamic.delete_batch_with_admission_control(ids, repair_beam, repair_degree)?;
+            let live_vectors = dynamic.len();
+            (result, live_vectors)
+        };
+        match &result {
+            GuardedDeleteResult::Applied { stats, report } => {
+                self.num_vectors = live_vectors;
+                info!(
+                    "guarded delete applied deleted={} live_vectors={} checked_landmarks={} elapsed_ms={}",
+                    stats.len(),
+                    self.num_vectors,
+                    report.checked_landmarks.len(),
+                    started.elapsed().as_millis()
+                );
+            }
+            GuardedDeleteResult::Deferred(report) => {
+                info!(
+                    "guarded delete deferred requested={} lost_landmarks={} elapsed_ms={}",
+                    report.requested,
+                    report.lost_landmarks.len(),
+                    started.elapsed().as_millis()
+                );
+            }
+        }
+        Ok(result)
     }
 
     /// Flushes pending update-workspace writes. Static handles are read-only.
@@ -1807,6 +1912,40 @@ mod tests {
         assert!(!reopened.is_updating());
         assert_eq!(reopened.num_vectors, 200);
         assert_eq!(reopened.search(&replacement, 1, 128).len(), 1);
+        let _ = fs::remove_file(static_path);
+        let _ = fs::remove_file(work_path);
+    }
+
+    #[test]
+    fn update_session_exposes_routability_guard() {
+        let static_path = "test_routability_static.db";
+        let work_path = "test_routability_work.db";
+        let _ = fs::remove_file(static_path);
+        let _ = fs::remove_file(work_path);
+        let vectors = (0..64)
+            .map(|id| vec![id as f32, (id % 7) as f32])
+            .collect::<Vec<_>>();
+        let static_index = DiskANN::build_index_default(&vectors, DistL2, static_path).unwrap();
+        let mut update = static_index
+            .begin_updates(vectors.len(), 1.2, work_path)
+            .unwrap();
+
+        let status = update
+            .enable_routability_guard(RoutabilityGuardConfig {
+                landmark_count: 3,
+                landmark_pool_multiplier: 2,
+                candidate_sample_size: 64,
+                beam_width: 32,
+            })
+            .unwrap();
+        assert!(status.enabled);
+        assert!(status.live_landmarks >= status.landmark_count);
+        assert!(update.assess_delete_admission(&[]).unwrap().admitted);
+
+        update.disable_routability_guard().unwrap();
+        assert!(!update.routability_guard_status().unwrap().enabled);
+        let (committed, _) = update.commit_updates_to_static(static_path).unwrap();
+        drop(committed);
         let _ = fs::remove_file(static_path);
         let _ = fs::remove_file(work_path);
     }

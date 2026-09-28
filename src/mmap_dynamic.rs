@@ -40,6 +40,107 @@ pub struct DeleteStats {
     pub repair_edges_attempted: usize,
 }
 
+/// Configuration for optional routability-aware deletion admission control.
+///
+/// The guard keeps a small, dispersed landmark pool in memory. Before a batch
+/// is changed, it virtually masks the proposed deleted vertices and confirms
+/// that the same residual entry point can still reach the selected landmarks
+/// with beam search. It is intentionally a lightweight preflight rather than
+/// a graph-wide connectivity oracle.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutabilityGuardConfig {
+    /// Number of landmark probes required for each delete batch.
+    pub landmark_count: usize,
+    /// Number of stored landmarks per required probe. Extra landmarks make an
+    /// occasional landmark deletion inexpensive to handle.
+    pub landmark_pool_multiplier: usize,
+    /// Maximum number of evenly sampled live vertices considered when forming
+    /// the farthest-first landmark pool.
+    pub candidate_sample_size: usize,
+    /// Beam width used for the virtual baseline and residual probes.
+    pub beam_width: usize,
+}
+
+impl Default for RoutabilityGuardConfig {
+    fn default() -> Self {
+        Self {
+            landmark_count: 6,
+            landmark_pool_multiplier: 4,
+            candidate_sample_size: 1024,
+            beam_width: 128,
+        }
+    }
+}
+
+impl RoutabilityGuardConfig {
+    fn normalized(self) -> Self {
+        Self {
+            landmark_count: self.landmark_count.max(1),
+            landmark_pool_multiplier: self.landmark_pool_multiplier.max(1),
+            candidate_sample_size: self.candidate_sample_size.max(1),
+            beam_width: self.beam_width.max(1),
+        }
+    }
+}
+
+/// Current state of the optional routability guard.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RoutabilityGuardStatus {
+    pub enabled: bool,
+    pub landmark_pool_size: usize,
+    pub live_landmarks: usize,
+    pub landmark_count: usize,
+    pub beam_width: usize,
+}
+
+/// Result of a virtual routability check for one proposed delete batch.
+///
+/// A false `admitted` value leaves the graph untouched when used through
+/// [`DiskANN::delete_batch_with_admission_control`](crate::DiskANN::delete_batch_with_admission_control).
+/// It is a signal to defer, split, or statically rebuild that batch.
+#[derive(Clone, Debug, Default)]
+pub struct RoutabilityAdmissionReport {
+    pub admitted: bool,
+    pub requested: usize,
+    pub entry: Option<u32>,
+    pub checked_landmarks: Vec<u32>,
+    pub baseline_reachable_landmarks: usize,
+    pub residual_reachable_landmarks: usize,
+    pub lost_landmarks: Vec<u32>,
+    /// Number of anchors drawn from a fresh small sample because the retained
+    /// pool had fewer than `landmark_count` live, non-deleted members.
+    pub supplemental_landmarks: usize,
+}
+
+/// Outcome of an atomic guarded deletion request.
+#[derive(Clone, Debug)]
+pub enum GuardedDeleteResult {
+    /// The preflight passed and MERIT repair was applied.
+    Applied {
+        stats: Vec<DeleteStats>,
+        report: RoutabilityAdmissionReport,
+    },
+    /// The preflight failed and the index was not modified.
+    Deferred(RoutabilityAdmissionReport),
+}
+
+impl GuardedDeleteResult {
+    pub fn report(&self) -> &RoutabilityAdmissionReport {
+        match self {
+            Self::Applied { report, .. } | Self::Deferred(report) => report,
+        }
+    }
+
+    pub fn was_applied(&self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
+}
+
+struct RoutabilityGuard {
+    config: RoutabilityGuardConfig,
+    landmark_pool: Vec<u32>,
+}
+
 #[derive(Clone)]
 struct DeletePlan {
     id: u32,
@@ -59,6 +160,7 @@ where
     mmap: MmapMut,
     work_path: PathBuf,
     dist: D,
+    routability_guard: Option<RoutabilityGuard>,
     _marker: PhantomData<T>,
 }
 
@@ -116,6 +218,7 @@ where
             mmap,
             work_path,
             dist: index.dist,
+            routability_guard: None,
             _marker: PhantomData,
         };
         out.write_metadata()?;
@@ -175,6 +278,188 @@ where
     pub fn flush(&self) -> Result<(), DiskAnnError> {
         self.mmap.flush()?;
         Ok(())
+    }
+
+    /// Enable a lightweight, in-memory routability guard for later guarded
+    /// deletions. The guard is a dynamic-session sidecar and is discarded when
+    /// the session commits to a static index.
+    pub(crate) fn enable_routability_guard(
+        &mut self,
+        config: RoutabilityGuardConfig,
+    ) -> Result<RoutabilityGuardStatus, DiskAnnError> {
+        let config = config.normalized();
+        let excluded = HashSet::new();
+        let entry = self.residual_entry(&excluded).ok_or_else(|| {
+            DiskAnnError::IndexError("cannot enable a routability guard on an empty index".into())
+        })?;
+        let pool_size = config
+            .landmark_count
+            .saturating_mul(config.landmark_pool_multiplier)
+            .max(config.landmark_count);
+        let landmark_pool = self.select_routability_landmarks(
+            &excluded,
+            entry,
+            pool_size,
+            config.candidate_sample_size,
+            &[],
+        );
+        if landmark_pool.is_empty() {
+            return Err(DiskAnnError::IndexError(
+                "routability guard requires at least two live vectors".into(),
+            ));
+        }
+        self.routability_guard = Some(RoutabilityGuard {
+            config,
+            landmark_pool,
+        });
+        let status = self.routability_guard_status();
+        debug!(
+            "routability guard enabled landmarks={} pool={} beam={}",
+            status.landmark_count, status.landmark_pool_size, status.beam_width
+        );
+        Ok(status)
+    }
+
+    /// Disable the in-memory routability guard without changing graph data.
+    pub(crate) fn disable_routability_guard(&mut self) {
+        self.routability_guard = None;
+    }
+
+    /// Return the status of the optional in-memory routability guard.
+    pub(crate) fn routability_guard_status(&self) -> RoutabilityGuardStatus {
+        let Some(guard) = &self.routability_guard else {
+            return RoutabilityGuardStatus::default();
+        };
+        RoutabilityGuardStatus {
+            enabled: true,
+            landmark_pool_size: guard.landmark_pool.len(),
+            live_landmarks: guard
+                .landmark_pool
+                .iter()
+                .filter(|&&id| self.is_valid(id))
+                .count(),
+            landmark_count: guard.config.landmark_count,
+            beam_width: guard.config.beam_width,
+        }
+    }
+
+    /// Assess a proposed delete batch without modifying the graph.
+    pub(crate) fn assess_delete_admission(
+        &self,
+        ids: &[u32],
+    ) -> Result<RoutabilityAdmissionReport, DiskAnnError> {
+        let guard = self.routability_guard.as_ref().ok_or_else(|| {
+            DiskAnnError::IndexError(
+                "routability guard is disabled; call enable_routability_guard first".into(),
+            )
+        })?;
+        let deleted = ids
+            .iter()
+            .copied()
+            .filter(|id| self.is_valid(*id))
+            .collect::<HashSet<_>>();
+        let mut report = RoutabilityAdmissionReport {
+            requested: deleted.len(),
+            ..RoutabilityAdmissionReport::default()
+        };
+        if deleted.is_empty() {
+            report.admitted = true;
+            return Ok(report);
+        }
+        let Some(entry) = self.residual_entry(&deleted) else {
+            return Ok(report);
+        };
+        report.entry = Some(entry);
+
+        let mut landmarks = guard
+            .landmark_pool
+            .iter()
+            .copied()
+            .filter(|id| self.is_valid(*id) && !deleted.contains(id))
+            .take(guard.config.landmark_count)
+            .collect::<Vec<_>>();
+        if landmarks.len() < guard.config.landmark_count {
+            let needed = guard.config.landmark_count - landmarks.len();
+            let supplemental = self.select_routability_landmarks(
+                &deleted,
+                entry,
+                needed,
+                guard.config.candidate_sample_size,
+                &landmarks,
+            );
+            report.supplemental_landmarks = supplemental.len();
+            landmarks.extend(supplemental);
+        }
+        report.checked_landmarks = landmarks.clone();
+        if landmarks.is_empty() {
+            return Ok(report);
+        }
+
+        let no_deletions = HashSet::new();
+        let probes = landmarks
+            .par_iter()
+            .map(|&landmark| {
+                let baseline = self
+                    .virtual_search_pool(
+                        self.vector(landmark),
+                        guard.config.beam_width,
+                        &no_deletions,
+                        entry,
+                    )
+                    .iter()
+                    .any(|candidate| candidate.id == landmark);
+                let residual = self
+                    .virtual_search_pool(
+                        self.vector(landmark),
+                        guard.config.beam_width,
+                        &deleted,
+                        entry,
+                    )
+                    .iter()
+                    .any(|candidate| candidate.id == landmark);
+                (landmark, baseline, residual)
+            })
+            .collect::<Vec<_>>();
+        report.baseline_reachable_landmarks =
+            probes.iter().filter(|(_, baseline, _)| *baseline).count();
+        report.residual_reachable_landmarks =
+            probes.iter().filter(|(_, _, residual)| *residual).count();
+        report.lost_landmarks = probes
+            .into_iter()
+            .filter_map(|(landmark, baseline, residual)| {
+                (baseline && !residual).then_some(landmark)
+            })
+            .collect();
+        report.admitted =
+            report.baseline_reachable_landmarks > 0 && report.lost_landmarks.is_empty();
+        debug!(
+            "routability preflight requested={} checked={} baseline={} residual={} lost={} admitted={}",
+            report.requested,
+            report.checked_landmarks.len(),
+            report.baseline_reachable_landmarks,
+            report.residual_reachable_landmarks,
+            report.lost_landmarks.len(),
+            report.admitted
+        );
+        Ok(report)
+    }
+
+    /// Atomically run the optional routability preflight and, only on success,
+    /// apply MERIT deletion repair. A deferred batch leaves all graph data
+    /// unchanged.
+    pub(crate) fn delete_batch_with_admission_control(
+        &mut self,
+        ids: &[u32],
+        repair_beam: usize,
+        repair_degree: usize,
+    ) -> Result<GuardedDeleteResult, DiskAnnError> {
+        let report = self.assess_delete_admission(ids)?;
+        if report.admitted {
+            let stats = self.delete_batch(ids, repair_beam, repair_degree);
+            Ok(GuardedDeleteResult::Applied { stats, report })
+        } else {
+            Ok(GuardedDeleteResult::Deferred(report))
+        }
     }
 
     pub(crate) fn search_with_dists(&self, query: &[T], k: usize, beam: usize) -> Vec<(u32, f32)> {
@@ -510,6 +795,106 @@ where
             |id| self.live_neighbors(id),
         )
     }
+
+    fn residual_entry(&self, deleted: &HashSet<u32>) -> Option<u32> {
+        if self.is_valid(self.meta.medoid_id) && !deleted.contains(&self.meta.medoid_id) {
+            return Some(self.meta.medoid_id);
+        }
+        (0..self.meta.capacity as u32).find(|id| self.is_valid(*id) && !deleted.contains(id))
+    }
+
+    fn select_routability_landmarks(
+        &self,
+        deleted: &HashSet<u32>,
+        entry: u32,
+        count: usize,
+        sample_size: usize,
+        existing: &[u32],
+    ) -> Vec<u32> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut references = existing.to_vec();
+        if !references.contains(&entry) {
+            references.push(entry);
+        }
+        let mut sample = Vec::new();
+        let mut seen = HashSet::new();
+        let stride = (self.meta.capacity / sample_size.max(1)).max(1);
+        for id in (0..self.meta.capacity as u32).step_by(stride) {
+            if id != entry
+                && self.is_valid(id)
+                && !deleted.contains(&id)
+                && !references.contains(&id)
+                && seen.insert(id)
+            {
+                sample.push(id);
+            }
+        }
+        if sample.len() < count {
+            for id in 0..self.meta.capacity as u32 {
+                if id != entry
+                    && self.is_valid(id)
+                    && !deleted.contains(&id)
+                    && !references.contains(&id)
+                    && seen.insert(id)
+                {
+                    sample.push(id);
+                }
+            }
+        }
+
+        let mut selected = Vec::new();
+        while selected.len() < count {
+            let next = sample
+                .iter()
+                .copied()
+                .filter(|id| !references.contains(id))
+                .max_by(|a, b| {
+                    let distance_a = references
+                        .iter()
+                        .map(|reference| self.dist.eval(self.vector(*a), self.vector(*reference)))
+                        .min_by(f32::total_cmp)
+                        .unwrap();
+                    let distance_b = references
+                        .iter()
+                        .map(|reference| self.dist.eval(self.vector(*b), self.vector(*reference)))
+                        .min_by(f32::total_cmp)
+                        .unwrap();
+                    distance_a.total_cmp(&distance_b)
+                });
+            let Some(next) = next else {
+                break;
+            };
+            references.push(next);
+            selected.push(next);
+        }
+        selected
+    }
+
+    fn virtual_search_pool(
+        &self,
+        query: &[T],
+        beam: usize,
+        deleted: &HashSet<u32>,
+        entry: u32,
+    ) -> Vec<Candidate> {
+        if deleted.contains(&entry) || !self.is_valid(entry) {
+            return Vec::new();
+        }
+        graph_search(
+            entry,
+            beam,
+            |id| self.dist.eval(query, self.vector(id)),
+            |id| {
+                self.live_neighbors(id)
+                    .into_iter()
+                    .filter(|neighbor| !deleted.contains(neighbor))
+                    .collect()
+            },
+        )
+    }
+
     fn prune(&self, source: u32, ids: &[u32]) -> Vec<u32> {
         let sv = self.vector(source);
         let mut c = ids
@@ -690,6 +1075,64 @@ mod tests {
         for id in reused {
             assert_eq!(d.search_with_dists(&vectors[id as usize], 1, 128)[0].0, id);
         }
+        let _ = fs::remove_file(base);
+        let _ = fs::remove_file(dynp);
+    }
+
+    #[test]
+    fn routability_guard_defers_a_bridge_delete_without_mutating_the_index() {
+        let dir = std::env::temp_dir();
+        let nonce = std::process::id();
+        let base = dir.join(format!("rust_diskann_guard_{nonce}.db"));
+        let dynp = dir.join(format!("rust_diskann_guard_{nonce}.work"));
+        let _ = fs::remove_file(&base);
+        let _ = fs::remove_file(&dynp);
+
+        let vectors = (0..10).map(|id| vec![id as f32]).collect::<Vec<_>>();
+        let index = DiskANN::build_index_default(&vectors, DistL2, base.to_str().unwrap()).unwrap();
+        let mut dynamic =
+            MmapDynamicDiskANN::create_from_static(&index, vectors.len(), 1.2, &dynp).unwrap();
+
+        // Force a directed chain so deleting node 4 removes the only route
+        // from entry 0 to the distant landmark(s).
+        dynamic.meta.medoid_id = 0;
+        for id in 0..vectors.len() as u32 {
+            if (id as usize) + 1 < vectors.len() {
+                dynamic.write_neighbors(id, &[id + 1]);
+            } else {
+                dynamic.write_neighbors(id, &[]);
+            }
+        }
+        let status = dynamic
+            .enable_routability_guard(RoutabilityGuardConfig {
+                landmark_count: 2,
+                landmark_pool_multiplier: 1,
+                candidate_sample_size: 16,
+                beam_width: 16,
+            })
+            .unwrap();
+        assert!(status.enabled);
+
+        let report = dynamic.assess_delete_admission(&[4]).unwrap();
+        assert!(report.baseline_reachable_landmarks > 0);
+        assert!(!report.admitted);
+        assert!(!report.lost_landmarks.is_empty());
+
+        match dynamic
+            .delete_batch_with_admission_control(&[4], 16, 2)
+            .unwrap()
+        {
+            GuardedDeleteResult::Deferred(deferred) => {
+                assert_eq!(deferred.lost_landmarks, report.lost_landmarks);
+            }
+            GuardedDeleteResult::Applied { .. } => {
+                panic!("bridge delete should be deferred")
+            }
+        }
+        assert!(dynamic.is_valid(4));
+
+        drop(dynamic);
+        drop(index);
         let _ = fs::remove_file(base);
         let _ = fs::remove_file(dynp);
     }

@@ -66,6 +66,7 @@ Commit is a sequential pass over the workspace followed by a sequential write of
 - **Transactional updates**: Opens a static index as a fixed-capacity temporary update session supporting `insert`, `insert_batch`, `delete`, and `delete_batch`, then commits an ordinary static index.
 - **Conflict-aware parallel repair**: Executes disjoint deletion repair plans concurrently while preserving deterministic ordering for overlapping candidate-node writes.
 - **Stale-edge safety**: Stores edge and node versions in parallel fixed-size regions, preventing old incoming edges from becoming valid when a deleted slot is reused.
+- **Optional routability-aware deletion guard**: Retains a small dispersed landmark pool and runs virtual beam-search probes before a delete batch. Batches that lose a landmark route reachable before virtual deletion are deferred before any graph mutation. The guard is disabled by default and does not change the static file format.
 - **Beam-search query algorithm**: Uses a medoid entry point and beam search over the graph, typically visiting only a small fraction of indexed vectors
 - **Generic over vector element type and distance**: Works with generic T and any anndists::Distance<T>, supporting use cases beyond standard floating-point ANN
 - **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distances
@@ -174,7 +175,7 @@ The static file format and search API remain unchanged. `begin_updates` creates 
 
 ```rust
 use anndists::dist::DistL2;
-use rust_diskann::DiskANN;
+use rust_diskann::{DiskANN, GuardedDeleteResult, RoutabilityGuardConfig};
 
 let static_index = DiskANN::<f32, DistL2>::build_index_default(
     &vectors,
@@ -192,13 +193,29 @@ let mut update = static_index.begin_updates(
 // deterministic conflict ordering.
 let inserted_ids = update.insert_batch(new_vectors, 128)?;
 
-let stats = update.delete_batch(&ids_to_delete)?;
+// Optional: initialize a small in-memory landmark pool for this update session.
+// It is not serialized into the eventual static index.
+update.enable_routability_guard(RoutabilityGuardConfig::default())?;
+
+match update.delete_batch_with_admission_control(&ids_to_delete)? {
+    GuardedDeleteResult::Applied { stats, report } => {
+        println!("applied {} repairs", stats.len());
+        assert!(report.admitted);
+    }
+    GuardedDeleteResult::Deferred(report) => {
+        eprintln!("defer batch; lost landmark routes: {:?}", report.lost_landmarks);
+        // Split the batch or schedule a static rebuild.
+    }
+}
+
 let (index, old_to_new_id) = update.commit_updates_to_static("static.db")?;
 // `index` is an ordinary static index; no version state is needed to search.
 // `old_to_new_id[old_slot]` records ID compaction; deleted slots map to `None`.
 ```
 
 Deleted slots are reused for later inserts; insertion returns an error when the transaction capacity is exhausted. Versioned edges make stale incoming edges immediately invisible during repair and slot reuse. Commit performs the graph-wide sequential cleanup required to remove those versions safely from the final static file.
+
+The routability guard compares bounded beam traversal from the same live entry point to a small set of dispersed landmarks before and during a virtual deletion. It admits a batch only when every previously reachable selected landmark remains reachable while the proposed IDs are masked; otherwise it leaves the update session unchanged. This is a lightweight safeguard against correlated bridge deletions, not a formal guarantee of Recall@\(k\).
 
 ## Space and time complexity analysis
 
