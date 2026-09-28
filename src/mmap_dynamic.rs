@@ -40,13 +40,14 @@ pub struct DeleteStats {
     pub repair_edges_attempted: usize,
 }
 
-/// Configuration for optional routability-aware deletion admission control.
+/// Configuration for routability-aware deletion admission control.
 ///
 /// The guard keeps a small, dispersed landmark pool in memory. Before a batch
 /// is changed, it virtually masks the proposed deleted vertices and confirms
 /// that the same residual entry point can still reach the selected landmarks
 /// with beam search. It is intentionally a lightweight preflight rather than
-/// a graph-wide connectivity oracle.
+/// a graph-wide connectivity oracle. [`Default`] is enabled automatically by
+/// [`DiskANN::begin_updates`](crate::DiskANN::begin_updates).
 #[derive(Clone, Copy, Debug)]
 pub struct RoutabilityGuardConfig {
     /// Number of landmark probes required for each delete batch.
@@ -305,7 +306,7 @@ where
         );
         if landmark_pool.is_empty() {
             return Err(DiskAnnError::IndexError(
-                "routability guard requires at least two live vectors".into(),
+                "routability guard requires at least one live vector".into(),
             ));
         }
         self.routability_guard = Some(RoutabilityGuard {
@@ -1131,7 +1132,18 @@ mod tests {
         }
         assert!(dynamic.is_valid(4));
 
-        drop(dynamic);
+        let mut update = DiskANN::from_dynamic(dynamic, DistL2);
+        let error = update.delete_batch(&[4]).unwrap_err();
+        match error {
+            DiskAnnError::IndexError(message) => {
+                assert!(message.contains("deferred by routability admission control"));
+            }
+            other => panic!("expected a routability deferral, got {other:?}"),
+        }
+        assert_eq!(update.num_vectors, vectors.len());
+        assert!(update.dynamic.as_ref().unwrap().is_valid(4));
+
+        drop(update);
         drop(index);
         let _ = fs::remove_file(base);
         let _ = fs::remove_file(dynp);

@@ -578,8 +578,12 @@ where
     }
 
     /// Starts a transient update session from a static index.
-    /// Commit it with `commit_updates_to_static`; the work file is not a
-    /// persistent index format and is never accepted by `open_index_with`.
+    ///
+    /// The default routability-aware deletion guard is initialized as an
+    /// in-memory sidecar for the session. It is not persisted in a later static
+    /// commit. Commit the session with `commit_updates_to_static`; the work file
+    /// is not a persistent index format and is never accepted by
+    /// `open_index_with`.
     pub fn begin_updates(
         self,
         capacity: usize,
@@ -597,11 +601,15 @@ where
             self.num_vectors, self.dim, self.max_degree, capacity, alpha, path
         );
         let dist = self.dist;
-        let dynamic =
+        let mut dynamic =
             mmap_dynamic::MmapDynamicDiskANN::create_from_static(&self, capacity, alpha, path)?;
+        let guard = dynamic.enable_routability_guard(RoutabilityGuardConfig::default())?;
         info!(
-            "dynamic update session ready work_path={} elapsed_ms={}",
+            "dynamic update session ready work_path={} guard_landmarks={} guard_pool={} guard_beam={} elapsed_ms={}",
             path,
+            guard.landmark_count,
+            guard.landmark_pool_size,
+            guard.beam_width,
             started.elapsed().as_millis()
         );
         Ok(Self::from_dynamic(dynamic, dist))
@@ -612,10 +620,12 @@ where
         self.dynamic.is_some()
     }
 
-    /// Enables the optional in-memory routability guard for this update session.
+    /// Reconfigures the in-memory routability guard for this update session.
     ///
-    /// The guard is disabled by default and is discarded when the session is
-    /// committed to a static index. It does not change the static file format.
+    /// `begin_updates` enables the default configuration automatically. This
+    /// method replaces that configuration with caller-supplied settings. The
+    /// guard is discarded when the session is committed to a static index and
+    /// never changes the static file format.
     pub fn enable_routability_guard(
         &mut self,
         config: RoutabilityGuardConfig,
@@ -627,7 +637,10 @@ where
         dynamic.enable_routability_guard(config)
     }
 
-    /// Disables the optional in-memory routability guard for this update session.
+    /// Disables routability admission control for this update session.
+    ///
+    /// This is an explicit opt-out: subsequent ordinary deletion calls use
+    /// unguarded MERIT repair until `enable_routability_guard` is called again.
     pub fn disable_routability_guard(&mut self) -> Result<(), DiskAnnError> {
         let dynamic = self
             .dynamic
@@ -637,7 +650,9 @@ where
         Ok(())
     }
 
-    /// Returns the current optional routability-guard state.
+    /// Returns the current routability-guard state.
+    ///
+    /// New update sessions are enabled by default.
     pub fn routability_guard_status(&self) -> Result<RoutabilityGuardStatus, DiskAnnError> {
         let dynamic = self
             .dynamic
@@ -648,8 +663,8 @@ where
 
     /// Runs a virtual routability preflight for a proposed delete batch.
     ///
-    /// Call [`Self::enable_routability_guard`] once before using this method.
-    /// The preflight does not mutate the update session.
+    /// New update sessions have the default guard enabled. The preflight does
+    /// not mutate the update session.
     pub fn assess_delete_admission(
         &self,
         ids: &[u32],
@@ -721,17 +736,43 @@ where
     }
 
     /// Deletes a batch with MERIT defaults: repair beam `2R` and `k_r = 2`.
+    ///
+    /// Routability admission control is enabled by default. A deferred batch
+    /// returns an error without mutating the graph; use
+    /// [`Self::delete_batch_with_admission_control`] when the structured
+    /// admission report is needed. Call [`Self::disable_routability_guard`] to
+    /// explicitly use unguarded MERIT repair.
     pub fn delete_batch(&mut self, ids: &[u32]) -> Result<Vec<DeleteStats>, DiskAnnError> {
         self.delete_batch_with_params(ids, 2 * self.max_degree, 2)
     }
 
     /// Deletes a batch with explicitly configured MERIT repair parameters.
+    ///
+    /// The default guard is applied before repair. A deferred batch returns an
+    /// error without changing the update session.
     pub fn delete_batch_with_params(
         &mut self,
         ids: &[u32],
         repair_beam: usize,
         repair_degree: usize,
     ) -> Result<Vec<DeleteStats>, DiskAnnError> {
+        if self.routability_guard_status()?.enabled {
+            return match self.delete_batch_with_admission_control_with_params(
+                ids,
+                repair_beam,
+                repair_degree,
+            )? {
+                GuardedDeleteResult::Applied { stats, .. } => Ok(stats),
+                GuardedDeleteResult::Deferred(report) => Err(DiskAnnError::IndexError(format!(
+                    "delete batch deferred by routability admission control: requested={}, checked_landmarks={}, baseline_routes={}, residual_routes={}, lost_landmark_ids={:?}",
+                    report.requested,
+                    report.checked_landmarks.len(),
+                    report.baseline_reachable_landmarks,
+                    report.residual_reachable_landmarks,
+                    report.lost_landmarks
+                ))),
+            };
+        }
         let started = Instant::now();
         info!(
             "deleting batch requested={} repair_beam={} repair_degree={}",
@@ -760,10 +801,11 @@ where
         Ok(stats)
     }
 
-    /// Deletes a batch only when the optional routability preflight admits it.
+    /// Deletes a batch only when the routability preflight admits it.
     ///
     /// This uses the standard MERIT defaults: repair beam `2R` and `k_r = 2`.
-    /// Enable the guard first with [`Self::enable_routability_guard`]. A
+    /// `begin_updates` enables the default guard automatically; callers may
+    /// replace its configuration with [`Self::enable_routability_guard`]. A
     /// deferred result leaves the update session entirely unchanged.
     pub fn delete_batch_with_admission_control(
         &mut self,
@@ -1930,6 +1972,15 @@ mod tests {
             .begin_updates(vectors.len(), 1.2, work_path)
             .unwrap();
 
+        let default_status = update.routability_guard_status().unwrap();
+        assert!(default_status.enabled);
+        assert_eq!(
+            default_status.landmark_count,
+            RoutabilityGuardConfig::default().landmark_count
+        );
+        assert!(default_status.live_landmarks >= default_status.landmark_count);
+        assert!(update.assess_delete_admission(&[]).unwrap().admitted);
+
         let status = update
             .enable_routability_guard(RoutabilityGuardConfig {
                 landmark_count: 3,
@@ -1944,7 +1995,9 @@ mod tests {
 
         update.disable_routability_guard().unwrap();
         assert!(!update.routability_guard_status().unwrap().enabled);
+        assert!(update.delete(0).unwrap().is_some());
         let (committed, _) = update.commit_updates_to_static(static_path).unwrap();
+        assert_eq!(committed.num_vectors, vectors.len() - 1);
         drop(committed);
         let _ = fs::remove_file(static_path);
         let _ = fs::remove_file(work_path);
