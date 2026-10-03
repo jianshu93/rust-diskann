@@ -14,6 +14,10 @@ use std::time::Instant;
 
 const DATA_OFFSET: u64 = 1024 * 1024;
 const MAGIC: [u8; 8] = *b"DYNANN01";
+// Match the static Vamana builder's balanced update granularity. A chunk is
+// planned against a consistent graph snapshot, then atomically merged before
+// the next chunk can use its new routes.
+const INSERT_MICRO_BATCH_SIZE: usize = 256;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DynamicMetadata {
@@ -150,6 +154,13 @@ struct DeletePlan {
     stats: DeleteStats,
 }
 
+/// One immutable plan for a batch insertion.  The reverse edges are merged by
+/// destination after all of these plans have been computed from one snapshot.
+struct InsertPlan {
+    id: u32,
+    outgoing: Vec<(u32, f32)>,
+}
+
 /// A fixed-capacity dynamic index. Vector and `u32` adjacency regions have the
 /// same row-major mmap layout as `DiskANN`; version and validity arrays follow.
 pub(crate) struct MmapDynamicDiskANN<T, D>
@@ -161,6 +172,7 @@ where
     mmap: MmapMut,
     work_path: PathBuf,
     dist: D,
+    live_count: usize,
     routability_guard: Option<RoutabilityGuard>,
     _marker: PhantomData<T>,
 }
@@ -219,31 +231,49 @@ where
             mmap,
             work_path,
             dist: index.dist,
+            live_count: index.num_vectors,
             routability_guard: None,
             _marker: PhantomData,
         };
         out.write_metadata()?;
-        for id in 0..capacity {
-            out.fill_neighbors(id as u32);
-        }
-        for id in 0..index.num_vectors {
-            out.write_vector(id as u32, &index.get_vector(id));
-            out.set_valid(id as u32, true);
-            let neighbors = index
-                .get_neighbors(id as u32)
-                .iter()
-                .copied()
-                .filter(|x| *x != PAD_U32)
-                .collect::<Vec<_>>();
-            out.write_neighbors(id as u32, &neighbors);
-        }
-        out.flush()?;
+
+        // The first `num_vectors` vector and adjacency rows are byte-for-byte
+        // compatible with the static layout.  Copying the two contiguous
+        // regions avoids one allocation and several small mmap writes per node.
+        let source = index
+            .mmap
+            .as_ref()
+            .ok_or_else(|| DiskAnnError::IndexError("source index mmap missing".into()))?;
+        let vector_bytes = index.num_vectors * index.dim * std::mem::size_of::<T>();
+        let source_vectors = index.vectors_offset as usize;
+        let destination_vectors = out.meta.vectors_offset as usize;
+        out.mmap[destination_vectors..destination_vectors + vector_bytes]
+            .copy_from_slice(&source[source_vectors..source_vectors + vector_bytes]);
+
+        let source_adjacency = index.adjacency_offset as usize;
+        let copied_adjacency_bytes =
+            index.num_vectors * index.max_degree * std::mem::size_of::<u32>();
+        let destination_adjacency = out.meta.adjacency_offset as usize;
+        let dynamic_adjacency_bytes = capacity * index.max_degree * std::mem::size_of::<u32>();
+        // PAD_U32 is all one bits, so this also works when the adjacency start
+        // is not naturally aligned for a `u32` slice.
+        out.mmap[destination_adjacency..destination_adjacency + dynamic_adjacency_bytes].fill(0xff);
+        out.mmap[destination_adjacency..destination_adjacency + copied_adjacency_bytes]
+            .copy_from_slice(&source[source_adjacency..source_adjacency + copied_adjacency_bytes]);
+
+        let valid = out.meta.valid_offset as usize;
+        out.mmap[valid..valid + index.num_vectors].fill(1);
+
+        // The workspace is transient.  The later static commit is the durable
+        // operation, so forcing a full synchronous write here only delays an
+        // insert without improving recovery semantics.
         debug!(
-            "dynamic workspace initialized path={} source_vectors={} capacity={} bytes={} elapsed_ms={}",
+            "dynamic workspace initialized path={} source_vectors={} capacity={} bytes={} copied_vector_bytes={} elapsed_ms={}",
             out.work_path.display(),
             index.num_vectors,
             capacity,
             file_len,
+            vector_bytes,
             started.elapsed().as_millis()
         );
         Ok(out)
@@ -265,12 +295,10 @@ where
         &self.meta.distance_name
     }
     pub fn len(&self) -> usize {
-        (0..self.meta.capacity)
-            .filter(|&id| self.is_valid(id as u32))
-            .count()
+        self.live_count
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.live_count == 0
     }
     pub fn is_valid(&self, id: u32) -> bool {
         (id as usize) < self.meta.capacity
@@ -505,7 +533,10 @@ where
             .map(|mut ids| ids.remove(0))
     }
 
-    /// Parallel search/planning, followed by deterministic graph commits.
+    /// Inserts a batch as Vamana micro-batches. Each chunk is planned against
+    /// one snapshot and merges reverse edges per destination before the next
+    /// chunk starts. All expensive distance work is parallel; final mmap row
+    /// writes are deterministic and conflict-free.
     pub fn insert_batch(
         &mut self,
         vectors: Vec<Vec<T>>,
@@ -527,30 +558,128 @@ where
                 "dynamic mmap capacity exhausted".into(),
             ));
         }
-        let pools = vectors
-            .par_iter()
-            .map(|v| {
-                self.search_pool(v, beam.max(self.meta.max_degree))
-                    .into_iter()
-                    .map(|c| c.id)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        for ((&id, vector), _) in slots.iter().zip(vectors.iter()).zip(pools.iter()) {
-            self.write_vector(id, vector);
-            self.fill_neighbors(id);
-            self.set_valid(id, true);
-        }
-        for (&id, pool) in slots.iter().zip(pools.iter()) {
-            let selected = self.prune(id, pool);
-            self.write_neighbors(id, &selected);
-            for target in selected {
-                self.insert_and_prune(target, id);
+
+        let mut total_outgoing_edges = 0usize;
+        let mut total_reverse_rows = 0usize;
+        for (chunk_index, (slot_chunk, vector_chunk)) in slots
+            .chunks(INSERT_MICRO_BATCH_SIZE)
+            .zip(vectors.chunks(INSERT_MICRO_BATCH_SIZE))
+            .enumerate()
+        {
+            let chunk_started = Instant::now();
+            for (&id, vector) in slot_chunk.iter().zip(vector_chunk.iter()) {
+                self.write_vector(id, vector);
+                self.fill_neighbors(id);
+                self.set_valid(id, true);
             }
+            self.live_count += slot_chunk.len();
+
+            let outgoing_started = Instant::now();
+            debug!(
+                "dynamic insert chunk={} phase=outgoing_plan start inserted={} beam={} rayon_workers={}",
+                chunk_index + 1,
+                slot_chunk.len(),
+                beam,
+                rayon::current_num_threads()
+            );
+            let plans = slot_chunk
+                .par_iter()
+                .zip(vector_chunk.par_iter())
+                .map(|(&id, vector)| {
+                    let pool = self.search_pool(vector, beam.max(self.meta.max_degree));
+                    let selected = self.prune_scored(
+                        id,
+                        pool.iter()
+                            .map(|candidate| (candidate.id, candidate.dist))
+                            .collect(),
+                    );
+                    let outgoing = selected
+                        .into_iter()
+                        .map(|target| {
+                            let distance = pool
+                                .iter()
+                                .find(|candidate| candidate.id == target)
+                                .expect("RobustPrune selected a candidate outside its pool")
+                                .dist;
+                            (target, distance)
+                        })
+                        .collect();
+                    InsertPlan { id, outgoing }
+                })
+                .collect::<Vec<_>>();
+            let outgoing_edges: usize = plans.iter().map(|plan| plan.outgoing.len()).sum();
+            debug!(
+                "dynamic insert chunk={} phase=outgoing_plan complete outgoing_edges={} elapsed_ms={}",
+                chunk_index + 1,
+                outgoing_edges,
+                outgoing_started.elapsed().as_millis()
+            );
+
+            let mut reverse_inputs = HashMap::<u32, Vec<(u32, f32)>>::new();
+            for plan in &plans {
+                for &(target, distance) in &plan.outgoing {
+                    reverse_inputs
+                        .entry(target)
+                        .or_default()
+                        .push((plan.id, distance));
+                }
+            }
+            let mut reverse_inputs = reverse_inputs.into_iter().collect::<Vec<_>>();
+            reverse_inputs.sort_unstable_by_key(|(source, _)| *source);
+            let reverse_started = Instant::now();
+            debug!(
+                "dynamic insert chunk={} phase=reverse_prune start reverse_rows={}",
+                chunk_index + 1,
+                reverse_inputs.len()
+            );
+            let reverse_updates = reverse_inputs
+                .par_iter()
+                .map(|(source, incoming)| {
+                    let source_vector = self.vector(*source);
+                    let mut candidates = self
+                        .live_neighbors(*source)
+                        .into_iter()
+                        .map(|id| (id, self.dist.eval(source_vector, self.vector(id))))
+                        .collect::<Vec<_>>();
+                    candidates.extend(incoming.iter().copied());
+                    (*source, self.prune_scored(*source, candidates))
+                })
+                .collect::<Vec<_>>();
+            debug!(
+                "dynamic insert chunk={} phase=reverse_prune complete reverse_rows={} elapsed_ms={}",
+                chunk_index + 1,
+                reverse_inputs.len(),
+                reverse_started.elapsed().as_millis()
+            );
+
+            for plan in &plans {
+                let outgoing = plan
+                    .outgoing
+                    .iter()
+                    .map(|(target, _)| *target)
+                    .collect::<Vec<_>>();
+                self.write_neighbors(plan.id, &outgoing);
+            }
+            for (source, neighbors) in reverse_updates {
+                self.write_neighbors(source, &neighbors);
+            }
+
+            total_outgoing_edges += outgoing_edges;
+            total_reverse_rows += reverse_inputs.len();
+            debug!(
+                "dynamic insert chunk={} inserted={} outgoing_edges={} reverse_rows={} elapsed_ms={}",
+                chunk_index + 1,
+                slot_chunk.len(),
+                outgoing_edges,
+                reverse_inputs.len(),
+                chunk_started.elapsed().as_millis()
+            );
         }
         debug!(
-            "dynamic insert planned_and_committed={} beam={} elapsed_ms={}",
+            "dynamic insert planned_and_committed={} outgoing_edges={} reverse_rows={} beam={} elapsed_ms={}",
             slots.len(),
+            total_outgoing_edges,
+            total_reverse_rows,
             beam,
             started.elapsed().as_millis()
         );
@@ -657,6 +786,7 @@ where
         for &id in &unique {
             self.set_valid(id, false);
         }
+        self.live_count -= unique.len();
         if deleted.contains(&self.meta.medoid_id)
             && let Some(id) = (0..self.meta.capacity).find(|&id| self.is_valid(id as u32))
         {
@@ -898,11 +1028,22 @@ where
 
     fn prune(&self, source: u32, ids: &[u32]) -> Vec<u32> {
         let sv = self.vector(source);
-        let mut c = ids
+        let candidates = ids
             .iter()
             .copied()
             .filter(|id| *id != source && self.is_valid(*id))
             .map(|id| (id, self.dist.eval(sv, self.vector(id))))
+            .collect::<Vec<_>>();
+        self.prune_scored(source, candidates)
+    }
+
+    /// RobustPrune using distances that were already obtained during a graph
+    /// search or a reverse-edge merge.  This avoids immediately recomputing the
+    /// query-to-candidate distances for large, high-dimensional insert batches.
+    fn prune_scored(&self, source: u32, candidates: Vec<(u32, f32)>) -> Vec<u32> {
+        let mut c = candidates
+            .into_iter()
+            .filter(|(id, _)| *id != source && self.is_valid(*id))
             .collect::<Vec<_>>();
         c.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut seen = HashSet::new();
@@ -939,17 +1080,6 @@ where
             alpha = (alpha * inc).min(target);
         }
         selected
-    }
-    fn insert_and_prune(&mut self, source: u32, target: u32) {
-        if !self.is_valid(source) || !self.is_valid(target) || source == target {
-            return;
-        }
-        let mut ids = self.live_neighbors(source);
-        if !ids.contains(&target) {
-            ids.push(target)
-        }
-        let selected = self.prune(source, &ids);
-        self.write_neighbors(source, &selected);
     }
     // See MERIT paper: Wu et.al., 2026. MERIT: Efficient In-Place Deletion for Dynamic Graph-Based Approximate Nearest Neighbor Indexes. arXiv preprint arXiv:2607.29173.
     fn repair_kr_mst_updates(
@@ -1041,7 +1171,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::DistL2;
+    use anndists::dist::{DistHamming, DistL2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::fs;
     #[test]
@@ -1076,6 +1206,54 @@ mod tests {
         for id in reused {
             assert_eq!(d.search_with_dists(&vectors[id as usize], 1, 128)[0].0, id);
         }
+        let _ = fs::remove_file(base);
+        let _ = fs::remove_file(dynp);
+    }
+
+    #[test]
+    fn mmap_hamming_insert_uses_multiple_micro_batches() {
+        let dir = std::env::temp_dir();
+        let nonce = std::process::id();
+        let base = dir.join(format!("rust_diskann_hamming_insert_{nonce}.db"));
+        let dynp = dir.join(format!("rust_diskann_hamming_insert_{nonce}.work"));
+        let _ = fs::remove_file(&base);
+        let _ = fs::remove_file(&dynp);
+
+        let mut rng = StdRng::seed_from_u64(91);
+        let initial = (0..512)
+            .map(|_| (0..128).map(|_| rng.r#gen::<u16>()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let inserted = (0..384)
+            .map(|_| (0..128).map(|_| rng.r#gen::<u16>()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let index = DiskANN::build_index(
+            &initial,
+            32,
+            64,
+            1.2,
+            1,
+            DistHamming,
+            base.to_str().unwrap(),
+        )
+        .unwrap();
+        let mut dynamic = MmapDynamicDiskANN::create_from_static(
+            &index,
+            initial.len() + inserted.len(),
+            1.2,
+            &dynp,
+        )
+        .unwrap();
+        let ids = dynamic.insert_batch(inserted.clone(), 64).unwrap();
+
+        assert_eq!(ids.len(), inserted.len());
+        assert_eq!(dynamic.len(), initial.len() + inserted.len());
+        for (id, vector) in ids.iter().zip(&inserted) {
+            assert!(!dynamic.live_neighbors(*id).is_empty());
+            assert!(!dynamic.search_with_dists(vector, 1, 512).is_empty());
+        }
+
+        drop(dynamic);
+        drop(index);
         let _ = fs::remove_file(base);
         let _ = fs::remove_file(dynp);
     }

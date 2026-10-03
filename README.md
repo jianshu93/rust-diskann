@@ -31,6 +31,16 @@ For batch deletion, repair plans declare their candidate-node write sets. Plans 
 
 The `k_r`-MST repair caches one symmetric distance matrix per local candidate set. Prim selection and parent ranking therefore compute each candidate-pair distance once instead of repeatedly scanning the original vectors.
 
+### Dynamic Micro-batched Insertion
+
+Insertion uses 256-node Vamana micro-batches. Each chunk first makes its new
+vectors visible, then computes outgoing search-and-prune plans in parallel from
+one graph snapshot. Reverse edges are grouped by destination and each affected
+destination is RobustPruned once, also in parallel. Only the final fixed-width
+mmap row writes are serialized, deterministically, after their read-only plans
+are complete. This avoids the former per-edge serial reverse-pruning bottleneck
+while retaining a standard static index after commit.
+
 ### Transient Update Layout
 
 The temporary update workspace keeps fixed-offset regions in one file:
@@ -64,6 +74,7 @@ Commit is a sequential pass over the workspace followed by a sequential write of
 - **Memory-mapped on-disk index**: Stores vectors and fixed-degree adjacency lists in a single file and memory-maps it for low-overhead loading and search.
 - **MERIT in-place deletion**: Uses bounded in-neighbor recovery, local `k_r`-MST repair, and versioned-edge invalidation to maintain graph connectivity without rebuilding the index.
 - **Transactional updates**: Opens a static index as a fixed-capacity temporary update session supporting `insert`, `insert_batch`, `delete`, and `delete_batch`, then commits an ordinary static index.
+- **Parallel micro-batch insertion**: Plans outgoing and grouped reverse-edge RobustPrune work with rayon in 256-node Vamana micro-batches; deterministic mmap row writes follow each completed batch.
 - **Conflict-aware parallel repair**: Executes disjoint deletion repair plans concurrently while preserving deterministic ordering for overlapping candidate-node writes.
 - **Stale-edge safety**: Stores edge and node versions in parallel fixed-size regions, preventing old incoming edges from becoming valid when a deleted slot is reused.
 - **Default routability-aware deletion guard**: Every `begin_updates` session retains a small dispersed landmark pool and ordinary deletion APIs run virtual beam-search probes before graph mutation. Batches that lose a landmark route reachable before virtual deletion are deferred without mutation. `disable_routability_guard()` is the explicit opt-out. The guard is in-memory only and does not change the static file format.
@@ -189,8 +200,8 @@ let mut update = static_index.begin_updates(
     "index.update-work",
 )?;
 
-// Independent graph searches are parallelized; adjacency commits preserve
-// deterministic conflict ordering.
+// Insertion is planned in parallel 256-node Vamana micro-batches. Reverse
+// updates are grouped by destination and RobustPruned once per affected row.
 let inserted_ids = update.insert_batch(new_vectors, 128)?;
 
 // The default landmark guard is initialized by begin_updates and is not
@@ -244,7 +255,7 @@ When host RAM is not large enough for mapping the entire database file, it is po
 
 ### Logging
 
-The library emits only key lifecycle events through the `log` facade and does not install a logger. Applications can initialize any compatible logger and use `RUST_LOG=info` for build/update/commit events or `RUST_LOG=debug` for MERIT repair summaries. Logging remains disabled by default.
+The library emits only key lifecycle events through the `log` facade and does not install a logger. Applications can initialize any compatible logger and use `RUST_LOG=info` for build/update/commit events or `RUST_LOG=debug` for MERIT repair and per-micro-batch insertion summaries. Logging remains disabled by default.
 
 ```bash
 # Build the library
@@ -271,6 +282,10 @@ cargo run --release --example merit_fashion_rebuild_baselines -- \
 # Optional second argument selects update batch size; 60 is 0.1% of 60,000.
 cargo run --release --example merit_fashion_rebuild_baselines -- \
     fashion-mnist-784-euclidean.hdf5 60
+
+# Optional third argument limits the run to comma-separated scenarios.
+cargo run --release --example merit_fashion_rebuild_baselines -- \
+    fashion-mnist-784-euclidean.hdf5 3000 insert_only
 
 # test SIFT dataset
 wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
@@ -304,6 +319,22 @@ For small 0.1% update batches (60 vectors per round), the same benchmark shows t
 | Delete + insert | 9.31-9.61 s | 0.51-0.59 s | 17.08x | -0.00002 to +0.00003 |
 
 These timings are from one local run and include the complete static commit. They demonstrate why the transactional design is most useful when each update touches a small fraction of a large index.
+
+### Version 0.4.5 Parallel Insertion Result
+
+The same Fashion-MNIST insert-only protocol was rerun with the parallel
+micro-batch inserter on 16 Rayon workers (`R=48`, build beam `128`, 3,000
+vectors inserted per round). Each dynamic result was committed and reopened as
+a standard static index before being compared with a fresh static rebuild of
+the identical active vectors.
+
+| Rounds | Fresh rebuild | Insert + static commit | Speedup | Recall@10 delta at beam 128 | Recall@10 delta at beam 256 |
+|---|---:|---:|---:|---:|---:|
+| 1-5 | 10.55-13.54 s | 0.91-0.97 s | 11.20-14.49x | -0.00003 to +0.00007 | -0.00003 to +0.00006 |
+
+The full per-round CSV is written by the benchmark. At the lower beam 32, the
+largest observed accumulated insert-only delta was -0.00036; normal search
+beams 128 and 256 retained the static-rebuild quality within the ranges above.
 
 
 ## Examples

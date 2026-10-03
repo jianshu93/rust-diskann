@@ -222,14 +222,20 @@ fn run(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
+    let args = std::env::args().collect::<Vec<_>>();
+    let path = args
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "data/fashion-mnist-784-euclidean.hdf5".into());
-    let batch = std::env::args()
-        .nth(2)
+    let batch = args
+        .get(2)
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(DEFAULT_BATCH);
+    let scenarios = args.get(3).map_or_else(
+        || vec!["delete_only", "insert_only", "mixed"],
+        |value| value.split(',').collect(),
+    );
     let data = AnnBenchmarkData::new(path)?;
     let vectors = data
         .train_data
@@ -239,7 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut csv = String::from(
         "scenario,round,active_n,beam,rebuild_recall,committed_recall,delta,rebuild_seconds,update_commit_seconds\n",
     );
-    for scenario in ["delete_only", "insert_only", "mixed"] {
+    for scenario in scenarios {
         run(scenario, &vectors, &data, batch, &mut csv)?;
     }
     fs::write("merit_fashion_rebuild_baselines.csv", csv)?;
