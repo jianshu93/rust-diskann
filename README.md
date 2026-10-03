@@ -27,9 +27,9 @@ Dynamic deletion follows the MERIT algorithm:
 4. Increment the deleted slot's version so all stale incoming edges become invalid without a graph-wide scan.
 5. Reuse the deleted fixed-capacity slot for a later insertion.
 
-For batch deletion, repair plans declare their candidate-node write sets. Plans with no overlapping writes run in parallel within the same dependency wave. Conflicting plans run in ordered waves, preventing lost adjacency updates without unsafe concurrent mmap writes.
+For batch deletion, all `k_r`-MSTs first emit their ordered directed `InsertAndPrune` operations. Operations are grouped by their mutable source adjacency row: each row queue remains serial and preserves the MERIT operation order, while distinct source rows are computed in parallel with Rayon. The final fixed-width mmap writes are serialized after the read-only work completes. This avoids dependency waves collapsing parallelism for clustered data, without permitting concurrent writes to the same row.
 
-The `k_r`-MST repair caches one symmetric distance matrix per local candidate set. Prim selection and parent ranking therefore compute each candidate-pair distance once instead of repeatedly scanning the original vectors.
+The `k_r`-MST repair caches one symmetric distance matrix per local candidate set. Prim selection and parent ranking therefore compute each candidate-pair distance once instead of repeatedly scanning the original vectors. Each source-row queue additionally caches immutable pair distances during its sequential RobustPrune operations; the neighbor choices are unchanged, while repeated high-dimensional distance evaluations are eliminated.
 
 ### Dynamic Micro-batched Insertion
 
@@ -75,7 +75,7 @@ Commit is a sequential pass over the workspace followed by a sequential write of
 - **MERIT in-place deletion**: Uses bounded in-neighbor recovery, local `k_r`-MST repair, and versioned-edge invalidation to maintain graph connectivity without rebuilding the index.
 - **Transactional updates**: Opens a static index as a fixed-capacity temporary update session supporting `insert`, `insert_batch`, `delete`, and `delete_batch`, then commits an ordinary static index.
 - **Parallel micro-batch insertion**: Plans outgoing and grouped reverse-edge RobustPrune work with rayon in 256-node Vamana micro-batches; deterministic mmap row writes follow each completed batch.
-- **Conflict-aware parallel repair**: Executes disjoint deletion repair plans concurrently while preserving deterministic ordering for overlapping candidate-node writes.
+- **Source-row parallel deletion repair**: Preserves ordered MERIT `InsertAndPrune` operations per mutable adjacency row, caches repeated distances, and parallelizes independent rows with Rayon.
 - **Stale-edge safety**: Stores edge and node versions in parallel fixed-size regions, preventing old incoming edges from becoming valid when a deleted slot is reused.
 - **Default routability-aware deletion guard**: Every `begin_updates` session retains a small dispersed landmark pool and ordinary deletion APIs run virtual beam-search probes before graph mutation. Batches that lose a landmark route reachable before virtual deletion are deferred without mutation. `disable_routability_guard()` is the explicit opt-out. The guard is in-memory only and does not change the static file format.
 - **Beam-search query algorithm**: Uses a medoid entry point and beam search over the graph, typically visiting only a small fraction of indexed vectors
@@ -307,6 +307,8 @@ At search beam 128:
 | Delete only | 1-5 | 11.20-13.79 s | 3.51-5.01 s | 2.75-3.19x | -0.00005 to +0.00001 |
 | Insert only | 1-5 | 10.72-14.02 s | 6.04-6.57 s | 1.63-2.32x | -0.00004 to +0.00012 |
 | Delete + insert | 1-5 | 10.12-10.53 s | 7.68-10.24 s | 0.99-1.35x | -0.00006 to +0.00003 |
+
+Version 0.4.7 additionally checked the source-row MERIT scheduler across five successive 535-vector delete batches from all 60,000 Fashion-MNIST vectors (`R=48`, build beam `128`). Update plus static commit took `0.593-0.975 s` per batch versus `13.797-15.293 s` for the matching fresh rebuild. Across search beams 32, 64, 128, and 256, Recall@10 deltas versus the matching static rebuild ranged from `-0.00016` to `+0.00004`.
 
 The commit cost includes scanning the workspace, filtering version-mismatched edges, compacting IDs, writing all surviving vectors and adjacency lists, removing the workspace, and reopening the result through the ordinary static loader. The benchmark writes detailed per-round results to `merit_fashion_rebuild_baselines.csv`.
 

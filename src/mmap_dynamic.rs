@@ -161,50 +161,6 @@ struct InsertPlan {
     outgoing: Vec<(u32, f32)>,
 }
 
-/// Color repair plans by their possible adjacency writes. Plans in the same
-/// wave have disjoint candidate sets and can therefore calculate and publish
-/// their repairs concurrently. Processing high-conflict plans first makes the
-/// greedy coloring much denser than the former ID-ordered layering scheme.
-fn conflict_aware_repair_waves(plans: &[DeletePlan]) -> Vec<Vec<usize>> {
-    let mut order = (0..plans.len()).collect::<Vec<_>>();
-    order.sort_unstable_by(|left, right| {
-        plans[*right]
-            .candidates
-            .len()
-            .cmp(&plans[*left].candidates.len())
-            .then_with(|| plans[*left].id.cmp(&plans[*right].id))
-    });
-
-    let mut colors_by_candidate = HashMap::<u32, Vec<usize>>::new();
-    let mut plan_colors = vec![0usize; plans.len()];
-    let mut color_count = 0usize;
-    for index in order {
-        let mut unavailable = HashSet::new();
-        for candidate in &plans[index].candidates {
-            if let Some(colors) = colors_by_candidate.get(candidate) {
-                unavailable.extend(colors.iter().copied());
-            }
-        }
-        let color = (0..)
-            .find(|color| !unavailable.contains(color))
-            .expect("an unbounded color iterator always has a free color");
-        color_count = color_count.max(color + 1);
-        plan_colors[index] = color;
-        for candidate in &plans[index].candidates {
-            colors_by_candidate
-                .entry(*candidate)
-                .or_default()
-                .push(color);
-        }
-    }
-
-    let mut waves = vec![Vec::new(); color_count];
-    for (index, color) in plan_colors.into_iter().enumerate() {
-        waves[color].push(index);
-    }
-    waves
-}
-
 /// A fixed-capacity dynamic index. Vector and `u32` adjacency regions have the
 /// same row-major mmap layout as `DiskANN`; version and validity arrays follow.
 pub(crate) struct MmapDynamicDiskANN<T, D>
@@ -219,6 +175,51 @@ where
     live_count: usize,
     routability_guard: Option<RoutabilityGuard>,
     _marker: PhantomData<T>,
+}
+
+/// Per-source cache for an ordered sequence of MERIT `InsertAndPrune`
+/// operations. Distances are immutable within a delete session, while the
+/// source row changes after every operation. Caching only the distances keeps
+/// the exact sequential RobustPrune decisions intact.
+struct RepairDistanceCache<'a, T, D>
+where
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync + Copy + Clone + 'static,
+{
+    index: &'a MmapDynamicDiskANN<T, D>,
+    distances: HashMap<u64, f32>,
+    evaluations: usize,
+}
+
+impl<'a, T, D> RepairDistanceCache<'a, T, D>
+where
+    T: bytemuck::Pod + Copy + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync + Copy + Clone + 'static,
+{
+    fn new(index: &'a MmapDynamicDiskANN<T, D>) -> Self {
+        Self {
+            index,
+            distances: HashMap::new(),
+            evaluations: 0,
+        }
+    }
+
+    fn distance(&mut self, left: u32, right: u32) -> f32 {
+        if left == right {
+            return 0.0;
+        }
+        let key = ((left as u64) << 32) | right as u64;
+        if let Some(distance) = self.distances.get(&key) {
+            return *distance;
+        }
+        let distance = self
+            .index
+            .dist
+            .eval(self.index.vector(left), self.index.vector(right));
+        self.distances.insert(key, distance);
+        self.evaluations += 1;
+        distance
+    }
 }
 
 impl<T, D> MmapDynamicDiskANN<T, D>
@@ -743,65 +744,8 @@ where
         if plans.is_empty() {
             return Vec::new();
         }
-        let waves = conflict_aware_repair_waves(&plans);
-        let wave_count = waves.len();
-        let min_wave_size = waves.iter().map(Vec::len).min().unwrap_or(0);
-        let max_wave_size = waves.iter().map(Vec::len).max().unwrap_or(0);
-
-        debug!(
-            "MERIT repair planned deletes={} scheduler=greedy_coloring conflict_waves={} min_wave_size={} max_wave_size={} repair_beam={} repair_degree={}",
-            plans.len(),
-            wave_count,
-            min_wave_size,
-            max_wave_size,
-            repair_beam,
-            repair_degree
-        );
-        let mut attempted = vec![0usize; plans.len()];
-        let progress_interval = (wave_count / 16).max(1);
-        for (wave_index, wave) in waves.into_iter().enumerate() {
-            let show_progress = wave_index == 0
-                || (wave_index + 1) % progress_interval == 0
-                || wave_index + 1 == wave_count;
-            let wave_started = Instant::now();
-            if show_progress {
-                let candidates = wave
-                    .iter()
-                    .map(|index| plans[*index].candidates.len())
-                    .sum::<usize>();
-                debug!(
-                    "MERIT repair wave={}/{} plans={} candidate_rows={} phase=start",
-                    wave_index + 1,
-                    wave_count,
-                    wave.len(),
-                    candidates
-                );
-            }
-            let results = wave
-                .par_iter()
-                .map(|&index| {
-                    (
-                        index,
-                        self.repair_kr_mst_updates(&plans[index].candidates, repair_degree.max(1)),
-                    )
-                })
-                .collect::<Vec<_>>();
-            for (index, (updates, edge_attempts)) in results {
-                for (source, neighbors) in updates {
-                    self.write_neighbors(source, &neighbors);
-                }
-                attempted[index] = edge_attempts;
-            }
-            if show_progress {
-                debug!(
-                    "MERIT repair wave={}/{} plans={} phase=complete elapsed_ms={}",
-                    wave_index + 1,
-                    wave_count,
-                    wave.len(),
-                    wave_started.elapsed().as_millis()
-                );
-            }
-        }
+        let (attempted, source_rows, operations, cached_distance_evaluations) =
+            self.apply_repair_operations_by_source(&plans, repair_beam, repair_degree.max(1));
 
         let stats = plans
             .into_iter()
@@ -813,11 +757,87 @@ where
             })
             .collect::<Vec<_>>();
         debug!(
-            "MERIT repair committed deletes={} elapsed_ms={}",
+            "MERIT repair committed deletes={} scheduler=source_row_queues source_rows={} operations={} cached_distance_evaluations={} elapsed_ms={}",
             stats.len(),
+            source_rows,
+            operations,
+            cached_distance_evaluations,
             started.elapsed().as_millis()
         );
         stats
+    }
+
+    /// Schedule the directed `InsertAndPrune` operations generated by all
+    /// local k_r-MSTs by their mutable source row. Operations for different
+    /// rows commute, while each source queue preserves MERIT's plan and edge
+    /// order. The final mmap writes are serialized after Rayon has computed
+    /// every row, so no worker concurrently mutates shared graph storage.
+    fn apply_repair_operations_by_source(
+        &mut self,
+        plans: &[DeletePlan],
+        repair_beam: usize,
+        repair_degree: usize,
+    ) -> (Vec<usize>, usize, usize, usize) {
+        let mut per_plan = plans
+            .par_iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                let (operations, attempted) =
+                    self.repair_kr_mst_operations(&plan.candidates, repair_degree);
+                (index, operations, attempted)
+            })
+            .collect::<Vec<_>>();
+        per_plan.sort_unstable_by_key(|(index, _, _)| *index);
+
+        let mut attempted = vec![0usize; plans.len()];
+        let mut operations_by_source = HashMap::<u32, Vec<u32>>::new();
+        let mut operation_count = 0usize;
+        for (index, operations, edge_attempts) in per_plan {
+            attempted[index] = edge_attempts;
+            operation_count += operations.len();
+            for (source, target) in operations {
+                operations_by_source.entry(source).or_default().push(target);
+            }
+        }
+        let mut source_queues = operations_by_source.into_iter().collect::<Vec<_>>();
+        source_queues.sort_unstable_by_key(|(source, _)| *source);
+        let source_rows = source_queues.len();
+        debug!(
+            "MERIT repair planned deletes={} scheduler=source_row_queues source_rows={} operations={} repair_beam={} repair_degree={}",
+            plans.len(),
+            source_rows,
+            operation_count,
+            repair_beam,
+            repair_degree
+        );
+
+        let repaired_rows = source_queues
+            .par_iter()
+            .map(|(source, targets)| {
+                let mut neighbors = self.live_neighbors(*source);
+                let mut cache = RepairDistanceCache::new(self);
+                for target in targets {
+                    if !neighbors.contains(target) {
+                        neighbors.push(*target);
+                    }
+                    neighbors = self.prune_with_distance_cache(*source, &neighbors, &mut cache);
+                }
+                (*source, neighbors, cache.evaluations)
+            })
+            .collect::<Vec<_>>();
+        let cached_distance_evaluations = repaired_rows
+            .iter()
+            .map(|(_, _, evaluations)| *evaluations)
+            .sum();
+        for (source, neighbors, _) in repaired_rows {
+            self.write_neighbors(source, &neighbors);
+        }
+        (
+            attempted,
+            source_rows,
+            operation_count,
+            cached_distance_evaluations,
+        )
     }
 
     fn prepare_delete_plans(&mut self, ids: &[u32], repair_beam: usize) -> Vec<DeletePlan> {
@@ -1086,6 +1106,7 @@ where
         )
     }
 
+    #[cfg(test)]
     fn prune(&self, source: u32, ids: &[u32]) -> Vec<u32> {
         let sv = self.vector(source);
         let candidates = ids
@@ -1095,6 +1116,24 @@ where
             .map(|id| (id, self.dist.eval(sv, self.vector(id))))
             .collect::<Vec<_>>();
         self.prune_scored(source, candidates)
+    }
+
+    /// The same RobustPrune calculation as [`Self::prune`], but with an
+    /// immutable per-source distance cache. Every queued `InsertAndPrune`
+    /// still runs in the original order.
+    fn prune_with_distance_cache(
+        &self,
+        source: u32,
+        ids: &[u32],
+        cache: &mut RepairDistanceCache<T, D>,
+    ) -> Vec<u32> {
+        let candidates = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != source && self.is_valid(*id))
+            .map(|id| (id, cache.distance(source, id)))
+            .collect::<Vec<_>>();
+        self.prune_scored_with_distance_cache(source, candidates, cache)
     }
 
     /// RobustPrune using distances that were already obtained during a graph
@@ -1141,14 +1180,61 @@ where
         }
         selected
     }
+
+    fn prune_scored_with_distance_cache(
+        &self,
+        source: u32,
+        candidates: Vec<(u32, f32)>,
+        cache: &mut RepairDistanceCache<T, D>,
+    ) -> Vec<u32> {
+        let mut c = candidates
+            .into_iter()
+            .filter(|(id, _)| *id != source && self.is_valid(*id))
+            .collect::<Vec<_>>();
+        c.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut seen = HashSet::new();
+        c.retain(|x| seen.insert(x.0));
+        c.truncate(750);
+        let mut selected = Vec::new();
+        let mut factors = vec![0f32; c.len()];
+        let target = self.meta.alpha.max(1.0);
+        let inc = target.min(1.2);
+        let mut alpha = 1.;
+        loop {
+            for i in 0..c.len() {
+                if selected.len() == self.meta.max_degree {
+                    return selected;
+                }
+                if factors[i] > alpha {
+                    continue;
+                }
+                let sid = c[i].0;
+                factors[i] = f32::MAX;
+                selected.push(sid);
+                for j in i + 1..c.len() {
+                    if factors[j] > target {
+                        continue;
+                    }
+                    let pair = cache.distance(c[j].0, sid);
+                    let f = if pair == 0. { f32::MAX } else { c[j].1 / pair };
+                    factors[j] = factors[j].max(f);
+                }
+            }
+            if alpha >= target {
+                break;
+            }
+            alpha = (alpha * inc).min(target);
+        }
+        selected
+    }
     // See MERIT paper: Wu et.al., 2026. MERIT: Efficient In-Place Deletion for Dynamic Graph-Based Approximate Nearest Neighbor Indexes. arXiv preprint arXiv:2607.29173.
-    fn repair_kr_mst_updates(
+    fn repair_kr_mst_operations(
         &self,
         candidates: &[u32],
         degree: usize,
-    ) -> (HashMap<u32, Vec<u32>>, usize) {
+    ) -> (Vec<(u32, u32)>, usize) {
         if candidates.is_empty() {
-            return (HashMap::new(), 0);
+            return (Vec::new(), 0);
         }
         // Prim selection and parent ranking revisit the same candidate pairs.
         // Compute each high-dimensional distance once and keep the small local
@@ -1180,7 +1266,7 @@ where
         let mut remaining = (0..count)
             .filter(|index| *index != start)
             .collect::<Vec<_>>();
-        let mut updates = HashMap::<u32, Vec<u32>>::new();
+        let mut operations = Vec::with_capacity(2 * degree * count.saturating_sub(1));
         let mut attempted = 0;
         while !remaining.is_empty() {
             let (ri, next_index) = remaining
@@ -1209,22 +1295,14 @@ where
                 .collect::<Vec<_>>();
             parents.sort_by(|a, b| a.1.total_cmp(&b.1));
             for (parent, _) in parents.into_iter().take(degree) {
-                for (source, target) in [(next, parent), (parent, next)] {
-                    let mut ids = updates
-                        .get(&source)
-                        .cloned()
-                        .unwrap_or_else(|| self.live_neighbors(source));
-                    if !ids.contains(&target) {
-                        ids.push(target);
-                    }
-                    updates.insert(source, self.prune(source, &ids));
-                }
+                operations.push((next, parent));
+                operations.push((parent, next));
                 attempted += 2;
             }
             connected.push(next_index);
             remaining.swap_remove(ri);
         }
-        (updates, attempted)
+        (operations, attempted)
     }
 }
 
@@ -1234,40 +1312,6 @@ mod tests {
     use anndists::dist::{DistHamming, DistL2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::fs;
-
-    #[test]
-    fn conflict_coloring_reuses_a_wave_for_independent_repairs() {
-        let plans = vec![
-            DeletePlan {
-                id: 10,
-                old_version: 0,
-                candidates: vec![1],
-                stats: DeleteStats::default(),
-            },
-            DeletePlan {
-                id: 11,
-                old_version: 0,
-                candidates: vec![1, 2],
-                stats: DeleteStats::default(),
-            },
-            DeletePlan {
-                id: 12,
-                old_version: 0,
-                candidates: vec![2],
-                stats: DeleteStats::default(),
-            },
-        ];
-        let waves = conflict_aware_repair_waves(&plans);
-        assert_eq!(waves.len(), 2);
-        for wave in waves {
-            let mut written = HashSet::new();
-            for index in wave {
-                for candidate in &plans[index].candidates {
-                    assert!(written.insert(*candidate));
-                }
-            }
-        }
-    }
 
     #[test]
     fn mmap_parallel_batches_persist_and_hide_stale_edges() {
@@ -1346,6 +1390,48 @@ mod tests {
             assert!(!dynamic.live_neighbors(*id).is_empty());
             assert!(!dynamic.search_with_dists(vector, 1, 512).is_empty());
         }
+
+        drop(dynamic);
+        drop(index);
+        let _ = fs::remove_file(base);
+        let _ = fs::remove_file(dynp);
+    }
+
+    #[test]
+    fn repair_distance_cache_preserves_each_ordered_prune() {
+        let dir = std::env::temp_dir();
+        let nonce = std::process::id();
+        let base = dir.join(format!("rust_diskann_prune_cache_{nonce}.db"));
+        let dynp = dir.join(format!("rust_diskann_prune_cache_{nonce}.work"));
+        let _ = fs::remove_file(&base);
+        let _ = fs::remove_file(&dynp);
+
+        let mut rng = StdRng::seed_from_u64(404);
+        let vectors = (0..160)
+            .map(|_| (0..32).map(|_| rng.r#gen::<f32>()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let index =
+            DiskANN::build_index(&vectors, 24, 48, 1.2, 1, DistL2, base.to_str().unwrap()).unwrap();
+        let dynamic =
+            MmapDynamicDiskANN::create_from_static(&index, vectors.len(), 1.2, &dynp).unwrap();
+
+        let source = 0;
+        let targets = (1..64).collect::<Vec<_>>();
+        let mut plain = dynamic.live_neighbors(source);
+        let mut cached = plain.clone();
+        let mut cache = RepairDistanceCache::new(&dynamic);
+        for target in targets {
+            if !plain.contains(&target) {
+                plain.push(target);
+            }
+            if !cached.contains(&target) {
+                cached.push(target);
+            }
+            plain = dynamic.prune(source, &plain);
+            cached = dynamic.prune_with_distance_cache(source, &cached, &mut cache);
+            assert_eq!(cached, plain);
+        }
+        assert!(cache.evaluations > 0);
 
         drop(dynamic);
         drop(index);
