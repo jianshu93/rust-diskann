@@ -161,6 +161,50 @@ struct InsertPlan {
     outgoing: Vec<(u32, f32)>,
 }
 
+/// Color repair plans by their possible adjacency writes. Plans in the same
+/// wave have disjoint candidate sets and can therefore calculate and publish
+/// their repairs concurrently. Processing high-conflict plans first makes the
+/// greedy coloring much denser than the former ID-ordered layering scheme.
+fn conflict_aware_repair_waves(plans: &[DeletePlan]) -> Vec<Vec<usize>> {
+    let mut order = (0..plans.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        plans[*right]
+            .candidates
+            .len()
+            .cmp(&plans[*left].candidates.len())
+            .then_with(|| plans[*left].id.cmp(&plans[*right].id))
+    });
+
+    let mut colors_by_candidate = HashMap::<u32, Vec<usize>>::new();
+    let mut plan_colors = vec![0usize; plans.len()];
+    let mut color_count = 0usize;
+    for index in order {
+        let mut unavailable = HashSet::new();
+        for candidate in &plans[index].candidates {
+            if let Some(colors) = colors_by_candidate.get(candidate) {
+                unavailable.extend(colors.iter().copied());
+            }
+        }
+        let color = (0..)
+            .find(|color| !unavailable.contains(color))
+            .expect("an unbounded color iterator always has a free color");
+        color_count = color_count.max(color + 1);
+        plan_colors[index] = color;
+        for candidate in &plans[index].candidates {
+            colors_by_candidate
+                .entry(*candidate)
+                .or_default()
+                .push(color);
+        }
+    }
+
+    let mut waves = vec![Vec::new(); color_count];
+    for (index, color) in plan_colors.into_iter().enumerate() {
+        waves[color].push(index);
+    }
+    waves
+}
+
 /// A fixed-capacity dynamic index. Vector and `u32` adjacency regions have the
 /// same row-major mmap layout as `DiskANN`; version and validity arrays follow.
 pub(crate) struct MmapDynamicDiskANN<T, D>
@@ -699,33 +743,40 @@ where
         if plans.is_empty() {
             return Vec::new();
         }
-        let mut waves: Vec<Vec<usize>> = Vec::new();
-        let mut last_write_wave = HashMap::<u32, usize>::new();
-        for (index, plan) in plans.iter().enumerate() {
-            let wave_index = plan
-                .candidates
-                .iter()
-                .filter_map(|id| last_write_wave.get(id).map(|wave| wave + 1))
-                .max()
-                .unwrap_or(0);
-            while waves.len() <= wave_index {
-                waves.push(Vec::new());
-            }
-            waves[wave_index].push(index);
-            for id in &plan.candidates {
-                last_write_wave.insert(*id, wave_index);
-            }
-        }
+        let waves = conflict_aware_repair_waves(&plans);
+        let wave_count = waves.len();
+        let min_wave_size = waves.iter().map(Vec::len).min().unwrap_or(0);
+        let max_wave_size = waves.iter().map(Vec::len).max().unwrap_or(0);
 
         debug!(
-            "MERIT repair planned deletes={} conflict_waves={} repair_beam={} repair_degree={}",
+            "MERIT repair planned deletes={} scheduler=greedy_coloring conflict_waves={} min_wave_size={} max_wave_size={} repair_beam={} repair_degree={}",
             plans.len(),
-            waves.len(),
+            wave_count,
+            min_wave_size,
+            max_wave_size,
             repair_beam,
             repair_degree
         );
         let mut attempted = vec![0usize; plans.len()];
-        for wave in waves {
+        let progress_interval = (wave_count / 16).max(1);
+        for (wave_index, wave) in waves.into_iter().enumerate() {
+            let show_progress = wave_index == 0
+                || (wave_index + 1) % progress_interval == 0
+                || wave_index + 1 == wave_count;
+            let wave_started = Instant::now();
+            if show_progress {
+                let candidates = wave
+                    .iter()
+                    .map(|index| plans[*index].candidates.len())
+                    .sum::<usize>();
+                debug!(
+                    "MERIT repair wave={}/{} plans={} candidate_rows={} phase=start",
+                    wave_index + 1,
+                    wave_count,
+                    wave.len(),
+                    candidates
+                );
+            }
             let results = wave
                 .par_iter()
                 .map(|&index| {
@@ -740,6 +791,15 @@ where
                     self.write_neighbors(source, &neighbors);
                 }
                 attempted[index] = edge_attempts;
+            }
+            if show_progress {
+                debug!(
+                    "MERIT repair wave={}/{} plans={} phase=complete elapsed_ms={}",
+                    wave_index + 1,
+                    wave_count,
+                    wave.len(),
+                    wave_started.elapsed().as_millis()
+                );
             }
         }
 
@@ -1174,6 +1234,41 @@ mod tests {
     use anndists::dist::{DistHamming, DistL2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::fs;
+
+    #[test]
+    fn conflict_coloring_reuses_a_wave_for_independent_repairs() {
+        let plans = vec![
+            DeletePlan {
+                id: 10,
+                old_version: 0,
+                candidates: vec![1],
+                stats: DeleteStats::default(),
+            },
+            DeletePlan {
+                id: 11,
+                old_version: 0,
+                candidates: vec![1, 2],
+                stats: DeleteStats::default(),
+            },
+            DeletePlan {
+                id: 12,
+                old_version: 0,
+                candidates: vec![2],
+                stats: DeleteStats::default(),
+            },
+        ];
+        let waves = conflict_aware_repair_waves(&plans);
+        assert_eq!(waves.len(), 2);
+        for wave in waves {
+            let mut written = HashSet::new();
+            for index in wave {
+                for candidate in &plans[index].candidates {
+                    assert!(written.insert(*candidate));
+                }
+            }
+        }
+    }
+
     #[test]
     fn mmap_parallel_batches_persist_and_hide_stale_edges() {
         let base = "test_mmap_base.db";
